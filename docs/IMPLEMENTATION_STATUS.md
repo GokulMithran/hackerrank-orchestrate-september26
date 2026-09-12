@@ -288,6 +288,164 @@ read the contract.
 
 ---
 
+## M3 — partial payment, installments, spending changes (complete, ready for Codex review)
+
+**Milestone and status:** M3 complete and model-free, per the Codex-relayed
+next action: partial-payment candidates, supplied installment-option matching,
+spending-change candidates, eligibility/preference/deadline/term checks, replay
+validation for every candidate, and negative tests for each rule. No provider
+imports, no network, no API key added.
+
+**Problem solved and observable behavior:** the M1 core only produced
+`full_payment` / `wait` / `not_recommended`. The engine now also generates
+`partial_payment` (two-payment schedules for requests that allow it),
+`installments` (schedules that exactly match a supplied `request_payment_options.csv`
+row and respect `max_installment_months`), and `full_payment` augmented by up to
+three `spending_changes_needed` actions (`stop:<event_id>` /
+`reduce_to:<event_id>:<amount>`) drawn only from non-protected, user-permitted,
+flexible `FixedSeries` debits. Every candidate — including spending-change ones —
+is proved safe by an independent replay before it may compete or be published.
+
+```
+$ python -m unittest discover -s code/tests -t code -p "test_*.py"
+Ran 185 tests in 6.649s          OK      (185 total; 79 in test_engine.py, up from 150/50)
+
+$ python code/main.py --mode deterministic --quiet
+audit: 0 finding(s), 0 error(s)
+wrote 250 rows to <repo>/output.csv
+method distribution: full_payment=53, installments=32, not_recommended=147, partial_payment=7, wait=11
+degraded rows: 2 | gate failures: 0 | unhandled errors: 0
+
+$ python code/evaluation/main.py --split dev
+affordability_status      : 6/10  macro-F1 0.608
+recommended_payment_method: 6/10  macro-F1 0.608
+payment_plan (exact)      : 5/10
+```
+
+**Files added:** `code/buy_or_wait/spending.py` (spending-change eligibility,
+combination search, and the single `apply()` used by both the planner and the
+validation replay).
+**Files changed:** `code/buy_or_wait/planner.py` (partial-payment, installment,
+and spending-change-augmented `full_payment` generators in `generate()`;
+`Candidate` gained `spending_changes`/`replay_forecast`; `choose()` replays
+against `candidate.replay_forecast or forecast`), `code/buy_or_wait/validation.py`
+(rules C5–C10, E1–E7; P1 rewritten to call `spending.apply_literals` so replay
+proves the *published* row, not the candidate object), `code/buy_or_wait/output.py`
+(explanation templates for `partial_payment`/`installments`, and for
+`full_payment` with spending changes), `code/main.py` (`decide_one` passes
+`payment_options`/`events` through to `planner.choose`/`validation.check`).
+
+### Contract decisions, including alternatives rejected
+
+1. **A spending action cites the series' most recent real event row, not the
+   synthetic future occurrence.** A future occurrence of a `FixedSeries` is a
+   `forecast.build`-created movement with an id like
+   `projected:category:description:date`, which is not a real CSV row and
+   cannot be cited. `series.event_ids[-1]` is the real row the series'
+   `flexibility`/`minimum_allowed_amount` were read from, and the action is
+   applied to every future occurrence of that `(category, description)` pair
+   within the window. Rejected inventing a synthetic id for the projected
+   occurrence — it would not resolve against `events_by_id` during the
+   independent replay, defeating the point of the check.
+2. **Spending changes are scoped to `recurrence.fixed` debit series only**,
+   never `recurrence.rates` (the per-category daily-rate essentials). A rate
+   series is the sum of many different transactions with no single `event_id`
+   to cite as `stop:<event_id>`/`reduce_to:<event_id>:<amount>`; representing
+   it at that grain would be a citation the row cannot actually prove.
+3. **`apply()` is the single production implementation of "what a spending
+   change does to a forecast."** The planner builds live `SpendingAction`
+   objects and calls `apply()` directly; the validation gate reconstructs
+   actions independently from the *published CSV strings* via
+   `spending.from_literal`/`apply_literals` and calls the same `apply()`. This
+   is a deliberate midpoint between full duplication (risk the two arithmetics
+   drift apart) and zero independence (the gate would just be re-trusting the
+   planner) — the gate is independent about *what the row says*, not about
+   *how a stop/reduce changes a balance*.
+4. **Installment term is `(last_payment_date - first_payment_date).days / 30`
+   as a `Decimal`, not calendar-month arithmetic.** Verified empirically
+   against the 5 real requests with both accepted and rejected installment
+   offers (`request_02/07/12/17/22`, `max_installment_months` 7/12/11/3/6): this
+   formula reproduces the accept/reject split gold implies; calendar-month
+   differencing does not.
+5. **Partial payment always lands its second payment on the same globally
+   reported `earliest_date_for_full_payment`**, never a remainder-specific
+   earlier date. `problem_statement.md`'s two-payment rule ties the second
+   payment to that one figure, and reusing it keeps `amount_safe_to_pay` and
+   `earliest_date_for_full_payment` single sources of truth rather than each
+   method computing its own capacity date.
+6. **`Candidate.replay_forecast` carries a candidate's own adjusted forecast**
+   (set only for spending-change candidates) so `choose()`'s verification loop
+   can replay each candidate against the forecast it was actually proved safe
+   under, while every other candidate still replays against the shared base
+   forecast. Rejected mutating a single shared forecast across candidates —
+   two spending-change candidates in the same call must not see each other's
+   cuts.
+7. **The validation gate's P1 rule reconstructs spending effects from the
+   published strings, not from `decision`'s originating candidate object.**
+   Otherwise a bug that produces a wrong-but-plausible-looking spending literal
+   would be validated by the same code path that produced it. This is the same
+   principle M1 already applied to plan replay, extended to cover the new
+   spending-change dimension.
+
+### Verification
+
+185 tests total (150 → 185), all offline, none touching a provider. The 35 new
+tests: `PartialPaymentTests` (5), `InstallmentTests` (5), `SpendingChangeTests`
+(3), and `M3GateTests` (19 negative/positive gate cases covering every C5–C10
+and E1–E7 rule plus a spending-change-specific P1 replay case), plus the
+`GateTests`/`PlannerTests` base classes were left untouched and still pass with
+the new default arguments (`recurrence=_NO_RECURRENCE`, `payment_options=()`,
+`events=()`) — confirming the M1 call sites needed no changes.
+
+Independent check of the published `output.csv`: exact header, 250 rows in
+`requests.csv` order, unique ids, 0 invariant violations, method distribution
+now spans all five methods (`full_payment=53, installments=32,
+not_recommended=147, partial_payment=7, wait=11`).
+
+### Known limitations and degraded cases
+
+1. **The DEV-split method mismatches present before M3 are unchanged by it, and
+   one (`request_02`) is now newly visible as an installment case.** All four
+   are traced to forecast-accuracy limits already flagged in the M1 write-up,
+   not to M3's candidate generation or gating:
+   - `request_02` (installments expected): the engine correctly finds and
+     replays `payment_option_05`, but the replay genuinely breaches the
+     minimum balance on `2025-09-10` against our forecast — the candidate
+     logic and replay are doing their job; the disagreement is upstream, in
+     how conservatively that month's essential spending is projected.
+   - `request_23` (wait expected): capacity arrives `2025-07-17`, two days
+     after the `2025-07-15` deadline — a small forecast timing error, same
+     class as the "mean date error 14.2 days" already reported for M1.
+   - `request_03` (wait expected) and `request_16` (full_payment expected):
+     both already documented in the M1 section as M2 (image extraction)
+     dependencies — a blank salary amount under-forecasts income
+     (`request_03`), and an unknown rent amount degrades the row entirely
+     (`request_16`).
+   None of these were "fixed" by adjusting M3 logic to match gold, since doing
+   so would mean tuning candidate generation against 4 known rows rather than
+   the contract.
+2. **Only `full_payment` carries spending-change candidates.** The plan and
+   `problem_statement.md` describe spending changes as a way to make a request
+   affordable; `wait`, `partial_payment`, and `installments` do not currently
+   try spending-change variants if their unmodified form is unsafe. This
+   matches every gold example seen (spending changes only co-occur with
+   `full_payment`), but is a scope decision worth Codex confirming rather than
+   an settled reading of the spec.
+3. **`evaluation/usage_report.md` remains empty** — M4, unaffected by M3.
+
+**Next milestone:** M2 — evidence extraction (messages/images), per the
+participant's stated order (M3 before M2, now complete).
+
+**Review requested from Codex:** yes. Worth attacking specifically: the
+event-id citation choice for a projected occurrence (decision 1), the
+day/30 installment-term formula (decision 4) against any installment requests
+outside the 5 already checked, whether spending changes should also be tried
+for `wait`/`partial_payment`/`installments` (limitation 2), and whether the
+four DEV mismatches are correctly attributed to M1 forecast accuracy rather
+than to a gap in M3's own logic.
+
+---
+
 ## M0 cleanup — response to `docs/reviews/M0_CODE_REVIEW.md` (fix-first, 8 findings)
 
 **Status:** R-M0-01 … R-M0-08 all fixed, all reproduced first, all covered by

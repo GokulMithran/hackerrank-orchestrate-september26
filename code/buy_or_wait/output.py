@@ -57,6 +57,10 @@ def render_explanation(decision: Decision, currency: str, requested: Decimal,
 
     if method == "full_payment":
         when = decision.payments[0].on_date
+        if decision.spending_changes:
+            return (f"Pay {amount} on {when.isoformat()} after applying the required spending "
+                    f"change(s) ({'; '.join(decision.spending_changes)}). "
+                    f"This keeps at least {floor} available over the next 90 days.")
         return (f"Pay {amount} today ({when.isoformat()}). "
                 f"This keeps at least {floor} available over the next 90 days.")
 
@@ -64,6 +68,19 @@ def render_explanation(decision: Decision, currency: str, requested: Decimal,
         when = decision.payments[0].on_date
         return (f"Wait until {when.isoformat()}, then pay {amount} in full. "
                 f"Paying sooner would take the balance below the {floor} minimum.")
+
+    if method == "partial_payment":
+        first, second = decision.payments
+        return (f"Pay {currency} {format_amount(first.amount)} on {first.on_date.isoformat()} "
+                f"and the remaining {currency} {format_amount(second.amount)} on "
+                f"{second.on_date.isoformat()}. This completes the {amount} request while "
+                f"keeping at least {floor} available throughout.")
+
+    if method == "installments":
+        first = decision.payments[0]
+        return (f"Use {len(decision.payments)} installments of {currency} "
+                f"{format_amount(first.amount)}, starting {first.on_date.isoformat()}. "
+                f"This completes the {amount} request while keeping at least {floor} available.")
 
     if method == "not_recommended":
         if decision.degraded:
@@ -81,7 +98,6 @@ def render_explanation(decision: Decision, currency: str, requested: Decimal,
                 f"today, the full amount cannot be completed safely within 90 days while "
                 f"keeping the {floor} minimum.")
 
-    # partial_payment / installments arrive in M3.
     raise PublishError(f"no explanation template for method {method!r}")
 
 

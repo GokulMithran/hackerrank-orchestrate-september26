@@ -99,8 +99,9 @@ def decide_one(context: RequestContext, rates) -> tuple[planner.Decision, list[v
     series = recurrence.detect(context.events, profile, request.request_date, rates)
     forecast = forecast_module.build(cash, series, request.request_date)
 
-    decision = planner.choose(request, profile, forecast)
-    failures = validation.check(decision, request, profile, forecast)
+    decision = planner.choose(request, profile, forecast, series, context.payment_options)
+    failures = validation.check(decision, request, profile, forecast,
+                                context.payment_options, context.events)
     if failures:
         decision = validation.conservative_fallback(
             request, "failed quality gate: " + "; ".join(str(f) for f in failures)

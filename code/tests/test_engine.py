@@ -14,11 +14,13 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from buy_or_wait import config, planner, recurrence, state, validation  # noqa: E402
+from buy_or_wait import config, planner, recurrence, spending, state, validation  # noqa: E402
 from buy_or_wait import forecast as F  # noqa: E402
 from buy_or_wait.fx import RateUnavailable, convert  # noqa: E402
 from buy_or_wait.money import ZERO  # noqa: E402
-from buy_or_wait.schema import ExchangeRate, FinancialEvent, Profile, RequestInput  # noqa: E402
+from buy_or_wait.schema import (  # noqa: E402
+    ExchangeRate, FinancialEvent, PaymentOption, Profile, RequestInput,
+)
 from tests import oracle  # noqa: E402
 
 D = Decimal
@@ -72,6 +74,28 @@ def build(events, prof=None, rates=None, when=TODAY):
     cash = state.reconstruct(events, prof, when, rates)
     rec = recurrence.detect(events, prof, when, rates)
     return cash, rec, F.build(cash, rec, when)
+
+
+def monthly_series(prefix, *, n=4, amount="500", direction="debit", category="rent",
+                    description="rent", last_offset=5, status="settled",
+                    flexibility="fixed", floor=None):
+    return [
+        event(f"{prefix}{i}", amount=amount, direction=direction, category=category,
+              description=description, status=status, flexibility=flexibility, floor=floor,
+              on=TODAY - timedelta(days=last_offset + 30 * i))
+        for i in range(n)
+    ]
+
+
+def option(option_id, *, request_id="request_01", method="installments", amount="500",
+           n=2, first=None, freq=30, fee="0", total=None) -> PaymentOption:
+    first = first if first is not None else TODAY
+    return PaymentOption(
+        payment_option_id=option_id, request_id=request_id, payment_method=method,
+        payment_amount=D(amount), number_of_payments=n, first_payment_date=first,
+        payment_frequency_days=freq, financing_fee=D(fee),
+        total_payable_amount=total if total is not None else D(amount) * n,
+    )
 
 
 # ----------------------------------------------------------------- FX -------
@@ -382,6 +406,132 @@ class PlannerTests(unittest.TestCase):
         self.assertEqual(decision.amount_safe_to_pay, D("50"))
 
 
+class PartialPaymentTests(unittest.TestCase):
+    def _forecast_with_later_capacity(self):
+        # Safe today is between 0 and requested; full capacity arrives day 10.
+        events = [event("c1", amount="6000", direction="credit", status="scheduled",
+                        category="salary", on=TODAY + timedelta(days=10))]
+        return build(events)[2]
+
+    def test_partial_payment_candidate_when_allowed_and_accepted(self):
+        forecast = self._forecast_with_later_capacity()
+        prof = profile(methods=("full_payment", "partial_payment"))
+        decision = planner.choose(request("12000", deadline_days=30, partial=True), prof, forecast)
+        self.assertEqual(decision.recommended_payment_method, "partial_payment")
+        self.assertEqual(decision.affordability_status, "affordable_with_plan")
+        self.assertEqual(len(decision.payments), 2)
+        first, second = decision.payments
+        self.assertEqual(first.on_date, TODAY)
+        self.assertEqual(second.on_date, TODAY + timedelta(days=10))
+        self.assertEqual(first.amount + second.amount, D("12000"))
+
+    def test_partial_payment_rejected_when_request_disallows_it(self):
+        forecast = self._forecast_with_later_capacity()
+        prof = profile(methods=("full_payment", "partial_payment"))
+        _, rejected = planner.generate(request("12000", partial=False), prof, forecast)
+        self.assertTrue(any("does not allow partial payment" in r for r in rejected))
+
+    def test_partial_payment_rejected_when_user_does_not_accept_it(self):
+        forecast = self._forecast_with_later_capacity()
+        prof = profile(methods=("full_payment",))
+        _, rejected = planner.generate(request("8000", partial=True), prof, forecast)
+        self.assertTrue(any("partial_payment: not in payment_methods" in r for r in rejected))
+
+    def test_partial_payment_rejected_when_remainder_lands_after_deadline(self):
+        forecast = self._forecast_with_later_capacity()
+        prof = profile(methods=("full_payment", "partial_payment"))
+        _, rejected = planner.generate(request("12000", deadline_days=5, partial=True), prof, forecast)
+        self.assertTrue(any("after the" in r and "deadline" in r for r in rejected))
+
+    def test_partial_payment_rejected_when_safe_today_is_zero(self):
+        _, _, forecast = build([])
+        prof = profile(balance="100", minimum="100", methods=("full_payment", "partial_payment"))
+        _, rejected = planner.generate(request("8000", partial=True), prof, forecast)
+        self.assertTrue(any("partial_payment: amount_safe_to_pay" in r for r in rejected))
+
+
+class InstallmentTests(unittest.TestCase):
+    def test_installment_candidate_matches_supplied_option_exactly(self):
+        _, _, forecast = build([])
+        prof = profile(methods=("installments",))
+        options = [option("payment_option_01", amount="500", n=2, first=TODAY + timedelta(days=3))]
+        decision = planner.choose(request("1000", deadline_days=60), prof, forecast, payment_options=options)
+        self.assertEqual(decision.recommended_payment_method, "installments")
+        self.assertEqual(decision.chosen_payment_option_id, "payment_option_01")
+        self.assertEqual([(p.on_date, p.amount) for p in decision.payments],
+                         [(TODAY + timedelta(days=3), D("500")),
+                          (TODAY + timedelta(days=33), D("500"))])
+
+    def test_installment_rejected_when_term_exceeds_max_installment_months(self):
+        _, _, forecast = build([])
+        prof = profile(methods=("installments",))  # max_installment_months=6
+        options = [option("payment_option_01", amount="200", n=12, freq=30)]  # ~11 months
+        _, rejected = planner.generate(request("2400", deadline_days=400), prof, forecast,
+                                       payment_options=options)
+        self.assertTrue(any("exceeds max_installment_months" in r for r in rejected))
+
+    def test_installment_rejected_when_max_installment_months_is_blank(self):
+        _, _, forecast = build([])
+        base = profile(methods=("installments",))
+        prof = Profile(**{**base.__dict__, "max_installment_months": None})
+        options = [option("payment_option_01", amount="500", n=2)]
+        _, rejected = planner.generate(request("1000"), prof, forecast, payment_options=options)
+        self.assertTrue(any("max_installment_months is blank" in r for r in rejected))
+
+    def test_installment_rejected_when_it_completes_after_the_deadline(self):
+        _, _, forecast = build([])
+        prof = profile(methods=("installments",))
+        options = [option("payment_option_01", amount="500", n=2, freq=30)]
+        _, rejected = planner.generate(request("1000", deadline_days=10), prof, forecast,
+                                       payment_options=options)
+        self.assertTrue(any("completes" in r and "after" in r for r in rejected))
+
+    def test_installment_not_offered_when_user_does_not_accept_it(self):
+        _, _, forecast = build([])
+        prof = profile(methods=("full_payment",))
+        options = [option("payment_option_01", amount="500", n=2)]
+        candidates, rejected = planner.generate(request("1000"), prof, forecast, payment_options=options)
+        self.assertEqual([c for c in candidates if c.method == "installments"], [])
+        self.assertTrue(any("installments: not in payment_methods" in r for r in rejected))
+
+
+class SpendingChangeTests(unittest.TestCase):
+    def _tight_forecast_with_stoppable_streaming(self):
+        # A future projected streaming debit that only breaches the minimum
+        # if it is not stopped.
+        events = monthly_series("net", n=4, amount="500", category="streaming",
+                                description="netflix", flexibility="stoppable")
+        prof = profile(balance="10000", minimum="9000", methods=("full_payment",))
+        _, rec, forecast = build(events, prof)
+        return prof, rec, forecast
+
+    def test_stopping_a_flexible_expense_makes_full_payment_safe(self):
+        prof, rec, forecast = self._tight_forecast_with_stoppable_streaming()
+        decision = planner.choose(request("900", deadline_days=60), prof, forecast, rec)
+        self.assertEqual(decision.recommended_payment_method, "full_payment")
+        self.assertEqual(decision.affordability_status, "affordable_with_plan")
+        self.assertEqual(len(decision.spending_changes), 1)
+        self.assertTrue(decision.spending_changes[0].startswith("stop:"))
+
+    def test_protected_category_never_offers_a_spending_change(self):
+        events = monthly_series("rent", n=4, amount="500", category="rent",
+                                description="rent", flexibility="stoppable")
+        prof = profile(methods=("full_payment",))  # "rent" is protected in profile()
+        _, rec, _ = build(events, prof)
+        actions = spending.eligible_actions(rec, prof)
+        self.assertEqual(actions, [])
+
+    def test_reduce_action_targets_the_series_minimum_allowed_amount(self):
+        events = monthly_series("din", n=4, amount="300", category="dining",
+                                description="eating out", flexibility="reducible", floor="100")
+        prof = profile(methods=("full_payment",))  # "dining" is willing-to-reduce in profile()
+        _, rec, _ = build(events, prof)
+        actions = spending.eligible_actions(rec, prof)
+        self.assertEqual(len(actions), 1)
+        self.assertEqual(actions[0].action, "reduce")
+        self.assertEqual(actions[0].new_amount, D("100"))
+
+
 class GateTests(unittest.TestCase):
     def check(self, decision, req=None, prof=None, forecast=None):
         req = req or request("1000")
@@ -436,6 +586,193 @@ class GateTests(unittest.TestCase):
         self.assertEqual(self.check(fallback), [])
         self.assertEqual(fallback.amount_safe_to_pay, ZERO)
         self.assertEqual(fallback.recommended_payment_method, "not_recommended")
+
+
+class M3GateTests(unittest.TestCase):
+    """Negative tests for C5-C10 (partial_payment, installments) and E1-E7
+    (spending_changes_needed), plus P1 replay of a spending-change claim."""
+
+    def check(self, decision, req, prof, forecast, payment_options=(), events=()):
+        return [f.rule for f in validation.check(decision, req, prof, forecast,
+                                                  payment_options, events)]
+
+    # ---- partial_payment (C5-C8) -------------------------------------------
+
+    def _partial_setup(self):
+        events = [event("c1", amount="6000", direction="credit", status="scheduled",
+                        category="salary", on=TODAY + timedelta(days=10))]
+        _, _, forecast = build(events)
+        prof = profile(methods=("full_payment", "partial_payment"))
+        req = request("12000", deadline_days=30, partial=True)
+        decision = planner.choose(req, prof, forecast)
+        return req, prof, forecast, decision
+
+    def test_good_partial_payment_passes(self):
+        req, prof, forecast, decision = self._partial_setup()
+        self.assertEqual(self.check(decision, req, prof, forecast), [])
+
+    def test_c6_partial_payment_when_request_disallows_it(self):
+        req, prof, forecast, decision = self._partial_setup()
+        bad_req = request("12000", deadline_days=30, partial=False)
+        self.assertIn("C6", self.check(decision, bad_req, prof, forecast))
+
+    def test_c7_partial_payment_amount_out_of_bounds(self):
+        req, prof, forecast, decision = self._partial_setup()
+        bad = planner.Decision(**{**decision.__dict__, "amount_safe_to_pay": D("0")})
+        self.assertIn("C7", self.check(bad, req, prof, forecast))
+
+    def test_c8_partial_payment_wrong_schedule_shape(self):
+        req, prof, forecast, decision = self._partial_setup()
+        bad = planner.Decision(**{**decision.__dict__,
+                                   "payments": (planner.Payment(TODAY, D("12000")),)})
+        self.assertIn("C8", self.check(bad, req, prof, forecast))
+
+    def test_c8_partial_payment_wrong_second_amount(self):
+        req, prof, forecast, decision = self._partial_setup()
+        first, second = decision.payments
+        bad = planner.Decision(**{**decision.__dict__,
+                                   "payments": (first, planner.Payment(second.on_date, D("1")))})
+        self.assertIn("C8", self.check(bad, req, prof, forecast))
+
+    # ---- installments (C9-C10) ---------------------------------------------
+
+    def _installment_setup(self):
+        _, _, forecast = build([])
+        prof = profile(methods=("installments",))
+        opts = [option("payment_option_01", amount="500", n=2, first=TODAY + timedelta(days=3))]
+        req = request("1000", deadline_days=60)
+        decision = planner.choose(req, prof, forecast, payment_options=opts)
+        return req, prof, forecast, opts, decision
+
+    def test_good_installments_passes(self):
+        req, prof, forecast, opts, decision = self._installment_setup()
+        self.assertEqual(self.check(decision, req, prof, forecast, opts), [])
+
+    def test_c9_installments_no_matching_option(self):
+        req, prof, forecast, opts, decision = self._installment_setup()
+        bad = planner.Decision(**{**decision.__dict__, "chosen_payment_option_id": "nonexistent"})
+        self.assertIn("C9", self.check(bad, req, prof, forecast, opts))
+
+    def test_c9_installments_wrong_schedule(self):
+        req, prof, forecast, opts, decision = self._installment_setup()
+        first, second = decision.payments
+        bad = planner.Decision(**{**decision.__dict__,
+                                   "payments": (first, planner.Payment(
+                                       second.on_date + timedelta(days=1), second.amount))})
+        self.assertIn("C9", self.check(bad, req, prof, forecast, opts))
+
+    def test_c10_installments_term_exceeds_max_months(self):
+        req, prof, forecast, _, decision = self._installment_setup()
+        long_opt = option("payment_option_09", amount="200", n=12, freq=30, first=TODAY)
+        long_req = request("2400", deadline_days=400)
+        long_decision = planner.Decision(**{**decision.__dict__,
+            "chosen_payment_option_id": "payment_option_09",
+            "payments": tuple(planner.Payment(TODAY + timedelta(days=30 * i), D("200"))
+                              for i in range(12))})
+        self.assertIn("C10", self.check(long_decision, long_req, prof, forecast, [long_opt]))
+
+    def test_c10_installments_max_months_blank(self):
+        req, prof, forecast, opts, decision = self._installment_setup()
+        blank_prof = Profile(**{**prof.__dict__, "max_installment_months": None})
+        self.assertIn("C10", self.check(decision, req, blank_prof, forecast, opts))
+
+    # ---- spending_changes_needed (E1-E7) -----------------------------------
+
+    def _spending_setup(self):
+        events = monthly_series("net", n=4, amount="500", category="streaming",
+                                description="netflix", flexibility="stoppable")
+        prof = profile(balance="10000", minimum="9000", methods=("full_payment",))
+        _, rec, forecast = build(events, prof)
+        req = request("900", deadline_days=60)
+        decision = planner.choose(req, prof, forecast, rec)
+        return req, prof, forecast, tuple(events), decision
+
+    def test_good_spending_change_passes(self):
+        req, prof, forecast, events, decision = self._spending_setup()
+        self.assertEqual(self.check(decision, req, prof, forecast, (), events), [])
+
+    def test_e1_spending_changes_require_affordable_with_plan(self):
+        req, prof, forecast, events, decision = self._spending_setup()
+        bad = planner.Decision(**{**decision.__dict__, "affordability_status": "affordable_now"})
+        self.assertIn("E1", self.check(bad, req, prof, forecast, (), events))
+
+    def test_e2_too_many_spending_changes(self):
+        req, prof, forecast, events, decision = self._spending_setup()
+        literal = decision.spending_changes[0]
+        bad = planner.Decision(**{**decision.__dict__, "spending_changes": (literal,) * 4})
+        self.assertIn("E2", self.check(bad, req, prof, forecast, (), events))
+
+    def test_e3_unparseable_spending_change(self):
+        req, prof, forecast, events, decision = self._spending_setup()
+        bad = planner.Decision(**{**decision.__dict__, "spending_changes": ("garbage",)})
+        self.assertIn("E3", self.check(bad, req, prof, forecast, (), events))
+
+    def test_e4_duplicate_event_reference(self):
+        req, prof, forecast, events, decision = self._spending_setup()
+        event_id = decision.spending_changes[0].split(":")[1]
+        bad = planner.Decision(**{**decision.__dict__,
+                                   "spending_changes": (f"stop:{event_id}",
+                                                        f"reduce_to:{event_id}:100")})
+        self.assertIn("E4", self.check(bad, req, prof, forecast, (), events))
+
+    def test_e5_unknown_event_id(self):
+        req, prof, forecast, events, decision = self._spending_setup()
+        bad = planner.Decision(**{**decision.__dict__, "spending_changes": ("stop:no_such_event",)})
+        self.assertIn("E5", self.check(bad, req, prof, forecast, (), events))
+
+    def test_e6_protected_category(self):
+        req, prof, forecast, events, decision = self._spending_setup()
+        rent_events = tuple(monthly_series("rent", n=4, amount="500", category="rent",
+                                           description="rent", flexibility="stoppable"))
+        bad = planner.Decision(**{**decision.__dict__, "spending_changes": ("stop:rent0",)})
+        self.assertIn("E6", self.check(bad, req, prof, forecast, (), events + rent_events))
+
+    def test_e7_wrong_flexibility_for_stop(self):
+        req, prof, forecast, events, decision = self._spending_setup()
+        # "streaming" is in willing_to_stop, but this event is "fixed", not stoppable.
+        fixed_events = tuple(monthly_series("fx", n=4, amount="200", category="streaming",
+                                            description="fixed sub", flexibility="fixed"))
+        bad = planner.Decision(**{**decision.__dict__, "spending_changes": ("stop:fx0",)})
+        self.assertIn("E7", self.check(bad, req, prof, forecast, (), events + fixed_events))
+
+    def test_e7_category_not_permitted_for_reduce(self):
+        req, prof, forecast, events, decision = self._spending_setup()
+        # "gym" is reducible but not in profile()'s willing_to_reduce (only "dining" is).
+        gym_events = tuple(monthly_series("gx", n=4, amount="300", category="gym",
+                                          description="membership", flexibility="reducible",
+                                          floor="100"))
+        bad = planner.Decision(**{**decision.__dict__, "spending_changes": ("reduce_to:gx0:100",)})
+        self.assertIn("E7", self.check(bad, req, prof, forecast, (), events + gym_events))
+
+    def test_e7_reduce_below_floor(self):
+        req, prof, forecast, events, decision = self._spending_setup()
+        dining_events = tuple(monthly_series("din", n=4, amount="300", category="dining",
+                                             description="eating out", flexibility="reducible",
+                                             floor="100"))
+        bad = planner.Decision(**{**decision.__dict__, "spending_changes": ("reduce_to:din0:50",)})
+        self.assertIn("E7", self.check(bad, req, prof, forecast, (), events + dining_events))
+
+    def test_e7_reduce_is_not_actually_a_reduction(self):
+        req, prof, forecast, events, decision = self._spending_setup()
+        dining_events = tuple(monthly_series("din", n=4, amount="300", category="dining",
+                                             description="eating out", flexibility="reducible",
+                                             floor="100"))
+        bad = planner.Decision(**{**decision.__dict__, "spending_changes": ("reduce_to:din0:300",)})
+        self.assertIn("E7", self.check(bad, req, prof, forecast, (), events + dining_events))
+
+    # ---- P1 replay of a spending-change claim ------------------------------
+
+    def test_p1_replay_catches_a_spending_change_that_frees_nothing(self):
+        req, prof, forecast, events, decision = self._spending_setup()
+        # A real, stoppable, willing-to-stop event -- but a stale settled one that
+        # is not the series' cited event and matches no projected movement, so
+        # stopping it frees no headroom and the payment still breaches.
+        unrelated = event("unrelated1", amount="50", category="streaming",
+                          description="a different subscription", flexibility="stoppable",
+                          on=TODAY - timedelta(days=200))
+        bad = planner.Decision(**{**decision.__dict__,
+                                   "spending_changes": (f"stop:{unrelated.event_id}",)})
+        self.assertIn("P1", self.check(bad, req, prof, forecast, (), events + (unrelated,)))
 
 
 if __name__ == "__main__":
