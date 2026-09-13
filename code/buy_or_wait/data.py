@@ -148,6 +148,22 @@ def parse_date_value(raw: Optional[str], *, where: str, allow_blank: bool = Fals
     return parsed
 
 
+def try_parse_iso_date(text: str) -> Optional[date]:
+    """The same strict `YYYY-MM-DD` shape check as `parse_date_value`, but
+    returns `None` on any failure instead of raising `DataError`.
+
+    For a caller validating an untrusted, non-CSV value (e.g. `evidence.py`
+    typing a model-proposed date) where the correct response to an invalid
+    shape is "reject this one fact", not "stop the whole run".
+    """
+    if not _ISO_DATE.match(text):
+        return None
+    try:
+        return date.fromisoformat(text)
+    except ValueError:
+        return None
+
+
 def parse_safe_id(raw: Optional[str], *, where: str) -> str:
     """Parse an identifier that will be used to build a filesystem path.
 

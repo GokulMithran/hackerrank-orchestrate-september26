@@ -5,34 +5,40 @@
     python code/main.py --mode deterministic --out output.csv
     python code/main.py --mode assisted --out output.csv
 
-Milestone status (see docs/IMPLEMENTATION_STATUS.md): M0 implements the
-contract, loaders, dataset audit, split manifest and this CLI. The prediction
-modes are wired but deliberately refuse to run until the financial engine lands
-in M1 -- emitting placeholder rows and calling them a baseline would be a false
-claim of implemented behaviour.
+Milestone status (see docs/IMPLEMENTATION_STATUS.md): M0 contract/loaders/audit,
+M1 deterministic financial core, M3 payment plans and spending changes, M2
+evidence extraction (assisted mode). deterministic mode never calls a model
+provider. assisted mode extracts and validates evidence facts, then runs the
+same deterministic core on a context with any resolved amounts patched in; it
+falls back to the deterministic result whenever no provider is configured or
+extraction is unavailable/fails.
 
-Exit codes: 0 success, 1 dataset audit errors, 2 not implemented yet.
+Exit codes: 0 success, 1 dataset audit errors.
 """
 from __future__ import annotations
 
 import argparse
+import dataclasses
+import json
 import sys
+import time
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))  # make `buy_or_wait` importable
 
+from buy_or_wait import assist  # noqa: E402
 from buy_or_wait import forecast as forecast_module  # noqa: E402
+from buy_or_wait import model as model_module  # noqa: E402
 from buy_or_wait import planner, recurrence, state, validation  # noqa: E402
 from buy_or_wait.audit import audit_dataset, errors  # noqa: E402
 from buy_or_wait.data import DataError, load_dataset  # noqa: E402
+from buy_or_wait.evidence import apply_facts_to_events, citation_note  # noqa: E402
 from buy_or_wait.output import PublishError, publish, to_row  # noqa: E402
 from buy_or_wait.schema import RequestContext  # noqa: E402
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_DATASET = REPO_ROOT / "dataset"
 DEFAULT_OUTPUT = REPO_ROOT / "output.csv"
-
-NOT_IMPLEMENTED = 2
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -115,15 +121,38 @@ def decide_one(context: RequestContext, rates) -> tuple[planner.Decision, list[v
     return decision, failures
 
 
+def _build_provider() -> model_module.Provider | None:
+    """Construct the real provider only if it is actually usable.
+
+    Any absence -- no API key, no `anthropic` package, any other
+    configuration problem -- must be a quiet `None`, never a crash: assisted
+    mode always has a deterministic-only fallback available.
+    """
+    try:
+        return model_module.AnthropicProvider()
+    except model_module.ProviderUnavailable:
+        return None
+
+
+def _build_assist_config(dataset_dir: Path) -> assist.AssistConfig:
+    provider = _build_provider()
+    cache_path = dataset_dir.parent / "code" / "evaluation" / "extraction_cache.json"
+    cache = model_module.ExtractionCache(path=cache_path)
+    cache.load()
+    return assist.AssistConfig(provider=provider, cache=cache)
+
+
 def run_predictions(dataset_dir: Path, out_path: Path, *, mode: str,
                     limit: int | None, quiet: bool) -> int:
-    if mode == "assisted":
-        print("--mode assisted needs the evidence layer (M2); not implemented yet.",
-              file=sys.stderr)
-        return NOT_IMPLEMENTED
-
     data = load_dataset(dataset_dir)
     requests = list(data.requests)[:limit] if limit else list(data.requests)
+
+    assist_config: assist.AssistConfig | None = None
+    traces: list[dict] = []
+    if mode == "assisted":
+        assist_config = _build_assist_config(dataset_dir)
+        if not quiet:
+            print(f"assisted mode provider status: {assist.provider_status(assist_config)}")
 
     rows: list[dict] = []
     gate_failures: list[str] = []
@@ -134,6 +163,12 @@ def run_predictions(dataset_dir: Path, out_path: Path, *, mode: str,
     for request in requests:
         try:
             context = data.context_for(request.request_id)
+            if mode == "assisted":
+                trace, accepted_facts = assist.extract_facts(context, data, assist_config)
+                traces.append(trace.to_json())
+                if accepted_facts:
+                    patched_events = apply_facts_to_events(context.events, accepted_facts)
+                    context = dataclasses.replace(context, events=patched_events)
             decision, failures = decide_one(context, data.rates_by_key)
             if failures:
                 gate_failures.append(f"{request.request_id}: {failures[0]}")
@@ -141,6 +176,10 @@ def run_predictions(dataset_dir: Path, out_path: Path, *, mode: str,
                 degraded.append(f"{request.request_id}: {decision.degradation_reason}")
             row = to_row(decision, context.profile.home_currency, request.requested_amount,
                          context.profile.minimum_balance_to_keep)
+            if mode == "assisted" and accepted_facts:
+                note = citation_note(trace)
+                if note:
+                    row["decision_explanation"] = f"{row['decision_explanation']} {note}"
         except Exception as exc:  # noqa: BLE001 - one row must not end the run
             crashed.append(f"{request.request_id}: {type(exc).__name__}: {exc}")
             decision = validation.conservative_fallback(
@@ -156,6 +195,22 @@ def run_predictions(dataset_dir: Path, out_path: Path, *, mode: str,
                   f"{decision.recommended_payment_method}")
 
     publish(rows, out_path, [r.request_id for r in requests], dataset_dir=dataset_dir)
+
+    if mode == "assisted" and assist_config is not None:
+        if assist_config.cache is not None:
+            assist_config.cache.save()
+        run_dir = Path(__file__).resolve().parent / "evaluation" / "runs" / time.strftime("%Y%m%dT%H%M%SZ", time.gmtime())
+        run_dir.mkdir(parents=True, exist_ok=True)
+        trace_path = run_dir / "trace.jsonl"
+        with trace_path.open("w", encoding="utf-8") as handle:
+            for trace in traces:
+                handle.write(json.dumps(trace) + "\n")
+        usage_path = run_dir / "usage.json"
+        usage_path.write_text(json.dumps({
+            "total": assist_config.ledger.total.as_dict(),
+            "per_request": {k: v.as_dict() for k, v in assist_config.ledger.per_request.items()},
+        }, indent=2), encoding="utf-8")
+        print(f"assisted-mode trace: {trace_path}")
 
     print(f"\nwrote {len(rows)} rows to {out_path}")
     print("method distribution: " + ", ".join(f"{k}={v}" for k, v in sorted(methods.items())))

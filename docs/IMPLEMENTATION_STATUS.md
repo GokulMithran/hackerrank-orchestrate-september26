@@ -446,6 +446,297 @@ than to a gap in M3's own logic.
 
 ---
 
+## M2 — evidence extraction and provenance (complete, ready for Codex review)
+
+**Milestone and status:** M2 complete. A bounded, auditable evidence layer
+extracts structured, cited facts from messages/images and repairs unknown
+`FinancialEvent.amount` values before the unmodified M1/M3 deterministic core
+runs. No change to `planner.py`, `forecast.py`, `recurrence.py`, `state.py`,
+or `validation.py`; `main.decide_one` is called identically in both modes.
+`--mode assisted` runs end to end and, with no provider configured (the only
+state exercised so far — no paid model run has been made per the standing
+instruction not to start one), produces byte-identical output to
+`--mode deterministic` on the full 250-request dataset.
+
+**Problem solved and observable behavior:** two DEV-split rows
+(`request_03`, `request_16`) and any future unresolved-debit row were
+previously stuck degraded or under-forecasting because a `FinancialEvent`
+had an unknown amount with no way to resolve it from its linked
+message/image. `evidence.py` now retrieves the exact request/user-scoped,
+time-bounded candidate set for a request; `model.py` calls a provider (real
+or fake) under a bounded timeout/retry/budget/cache wrapper to propose facts
+from that evidence; every proposed fact is independently validated for
+citation reality, ownership, relevance, category exactness, and amount
+parseability before being accepted; conflicting facts for the same event are
+resolved by explicit precedence (amendment/cancellation > newer same-source
+evidence > financially safer amount); and only accepted facts patch
+`FinancialEvent.amount` (never overwriting a known amount, only repairing an
+unknown one, or applying an explicit amendment/cancellation) before the
+existing deterministic pipeline runs unchanged.
+
+```
+$ python -B -m unittest discover -s code/tests -t code -p "test_*.py"
+Ran 239 tests in ~8.5s          OK      (239 total; 54 new: 28 in test_evidence.py,
+                                          15 in test_model.py, 11 in test_assist.py)
+
+$ python code/main.py --mode deterministic --quiet
+audit: 0 finding(s), 0 error(s)
+wrote 250 rows to <repo>/output.csv
+method distribution: full_payment=53, installments=32, not_recommended=147, partial_payment=7, wait=11
+degraded rows: 2 | gate failures: 0 | unhandled errors: 0
+
+$ python code/main.py --mode assisted --quiet --out <tmp>/assisted_full.csv
+assisted mode provider status: unavailable        (no ANTHROPIC_API_KEY set)
+wrote 250 rows to <tmp>/assisted_full.csv
+$ diff output.csv <tmp>/assisted_full.csv
+                                                    (no output: files identical)
+```
+
+**Files added:** `code/buy_or_wait/evidence.py` (candidate retrieval with the
+documented availability cutoff, `ProposedFact`/`ExtractedFact`, citation
+validation, exact-taxonomy category alignment, free-text amount parsing,
+conflict resolution, `apply_facts_to_events`, `RowTrace`);
+`code/buy_or_wait/model.py` (`Provider` protocol, `FakeProvider` for offline
+tests, `AnthropicProvider` gated by `ANTHROPIC_API_KEY` + optional `anthropic`
+import, `BoundedCaller` — `ThreadPoolExecutor`-based per-row timeout, bounded
+retry/backoff against a monotonic deadline, never retrying `AuthError`,
+per-row/full-run budgets via `UsageLedger` — and `ExtractionCache`, content-hash
+keyed by source content + model + prompt/schema version + request context);
+`code/buy_or_wait/assist.py` (`AssistConfig`, `extract_facts` — the fail-closed
+orchestration entry point); `code/prompts/extraction_v1.md` (the versioned
+extraction policy: untrusted-content rules, candidate-handle-only citation
+instructions, exact-taxonomy instructions, "return unresolved rather than
+guess"); `code/tests/test_evidence.py`, `code/tests/test_model.py`,
+`code/tests/test_assist.py` (54 new tests).
+**Files changed:** `code/main.py` (`--mode assisted` now builds a provider via
+`_build_provider()` — catching `ProviderUnavailable` to `None` — constructs an
+`AssistConfig`, calls `assist.extract_facts` per request, patches the context
+via `evidence.apply_facts_to_events` + `dataclasses.replace`, then calls the
+same `decide_one`; writes a `trace.jsonl`/`usage.json` pair per run under
+`code/evaluation/runs/<UTC timestamp>/`); `code/buy_or_wait/__init__.py`
+(module map extended; the "nothing imports a model provider" claim narrowed to
+name `model.py` as the sole, guarded exception).
+
+### Contract decisions, including alternatives rejected
+
+1. **`evidence.py` never imports `model.py`.** `ProposedFact` (the shape a
+   provider returns) lives in `evidence.py` so the pure validation logic —
+   citation/category/amount/conflict rules — is importable and testable with
+   zero provider dependency. `model.py` imports `evidence.ProposedFact`, and
+   `assist.py` is the only module that imports both. Rejected putting
+   `ProposedFact` in `model.py`: that would force every offline evidence test
+   to import provider machinery it does not need.
+2. **The message/image availability cutoff is a message's `sent_at` *date*,
+   compared verbatim to `request_date`, with no timezone shift.** This was
+   flagged as M2's open decision in the M0 write-up. A request carries only a
+   date, so assuming a timezone to convert a UTC `sent_at` into "the user's
+   day" would be an invented fact. An image carries no timestamp at all; its
+   availability is instead derived from its `related_event_id`'s date when
+   linked (a future-dated linked event makes the image unavailable for the
+   same reason a future message would be), and available unconditionally
+   otherwise. Rejected treating every image as always available regardless
+   of link: that would let evidence for a not-yet-happened event leak into a
+   decision as if already known.
+3. **A future *scheduled* financial event is not "unavailable evidence."**
+   Only messages/images have an availability cutoff; a structured
+   `FinancialEvent` row is confirmed data already handled by
+   `recurrence.py`/`forecast.py` regardless of its date, and remains citable.
+   Conflating the two would incorrectly suppress citations for legitimate
+   future-dated structured records.
+4. **Category alignment is exact-match only, no alias table.**
+   `docs/IMPLEMENTATION_STATUS.md`'s M0 decision 4 measured that every
+   protect/reduce/stop token in the shipped data is already an exact
+   `EVENT_CATEGORIES` member, and there is no `other` category to fall back
+   to. A paraphrased or invented category (`"fast_food"`, `"food and drink"`)
+   is rejected outright. Rejected building a fuzzy/alias mapping: the review
+   checklist explicitly requires ambiguity to never authorize a spending
+   change, and a hand-built alias table is exactly the kind of invented
+   mapping the milestone forbids.
+5. **`amount`, `amended_amount`, and `cancelled` are conflict-grouped
+   together per target event, not kept in separate per-field groups.**
+   Discovered while writing `ConflictResolutionTests`: without this, an
+   amendment/cancellation and a plain `amount` fact for the same event would
+   both remain `accepted` in the trace (even though `apply_facts_to_events`
+   already applies them in the correct precedence order), losing the
+   "preserve accepted and rejected provenance" guarantee the plan requires.
+   Fixed in `evidence.resolve_conflicts` by grouping on a shared
+   `"amount_or_status"` key for those three fields.
+6. **`apply_facts_to_events` only repairs an `amount` fact onto an event
+   whose amount is currently `None`; it never overwrites a known amount from
+   a plain `amount` fact.** Only `amended_amount`/`cancelled` — which the
+   conflict resolver has already ranked as an explicit correction — may
+   override a known value. Rejected letting any accepted `amount` fact
+   override a known value: a model restating an already-known amount
+   (correctly or with a transcription slip) must never silently outrank the
+   structured CSV row.
+7. **`BoundedCaller` shares one monotonic deadline across all retry attempts
+   for a row, and never retries `AuthError` or an exception it cannot
+   classify as `TransientError`.** Retrying an unclassified exception would
+   risk multiplying calls against an unknown failure mode (this was one of
+   the August lessons in `docs/REPOSITORY_ANALYSIS.md`: "Retries do not
+   implement explicit operational budgets ... immediately retries all
+   exceptions"). `ThreadPoolExecutor` + `future.result(timeout=...)` was used
+   for the per-call timeout instead of `signal.alarm`, since this
+   environment is Windows (`win32`) and `SIGALRM` is not available there.
+8. **The extraction cache key hashes source content + model id + prompt
+   version + schema version + request context, not media identity alone.**
+   August's cache keyed only by kind and media id
+   (`docs/REPOSITORY_ANALYSIS.md`: "Cache identity is too weak for
+   reproducible changed inputs"); the same image under a different prompt or
+   schema version must miss, not silently reuse a stale extraction.
+9. **`assist.extract_facts` catches every exception at its outer boundary and
+   always returns a `RowTrace` plus (possibly empty) accepted facts; it never
+   raises.** One row's extraction failure (timeout, budget exhaustion,
+   provider error, or an unexpected bug) must degrade only that row to the
+   deterministic result, matching `run_predictions`'s existing per-row
+   `try/except` in `main.py` — assisted mode adds a second failure-isolation
+   boundary rather than replacing the first.
+10. **No separate "assisted" code path duplicates `decide_one`.** Assisted
+    mode calls the identical `main.decide_one(context, rates)` used by
+    deterministic mode, on a context whose `events` tuple has been patched
+    via `dataclasses.replace`. This was the explicit instruction ("this is
+    the core routing function; every request takes exactly this path") and
+    was verified directly: `--mode assisted` with no provider configured
+    produces byte-for-byte identical `output.csv` rows to `--mode
+    deterministic` on the full 250-request dataset.
+
+### Tests and exact commands with results
+
+```
+$ python -B -m unittest discover -s code/tests -t code -p "test_*.py"
+Ran 239 tests in 8.5s   OK
+
+$ python code/main.py --mode deterministic --quiet
+audit: 0 finding(s), 0 error(s)
+wrote 250 rows to output.csv
+degraded rows: 2 | gate failures: 0 | unhandled errors: 0
+
+$ python code/main.py --mode assisted --quiet --out <tmp>.csv
+assisted mode provider status: unavailable
+wrote 250 rows to <tmp>.csv
+degraded rows: 2 | gate failures: 0 | unhandled errors: 0
+$ diff output.csv <tmp>.csv   ->   no differences
+```
+
+New test files and what each covers against the milestone's required-tests
+list: `code/tests/test_evidence.py` (28 tests) — same-user/cross-user/blank-
+request-id scoping, future message/image exclusion, future scheduled-event
+non-exclusion, fabricated/unretrieved/wrong-user/irrelevant citation
+rejection, invalid-citation invalidates the whole claim, exact/invented/
+ambiguous category handling, multilingual/formatted numeric parsing,
+amendment/cancellation conflict precedence, resolved-amount state repair,
+plain-amount-never-overwrites-known-amount, prompt-injection text cannot
+forge a category or bypass citation checks. `code/tests/test_model.py` (15
+tests) — `AnthropicProvider` fails closed without a key, successful call
+usage accounting, transient-error retry-then-succeed, `AuthError` never
+retried, persistent-timeout bounded-attempt exhaustion, deadline-aware
+backoff stopping retries early, per-row and full-run budget exhaustion,
+unclassified-exception non-retry, cache miss/hit/key-sensitivity to source
+content/model id/prompt version, and a stored record under a mismatched key
+never being served. `code/tests/test_assist.py` (11 tests) — no-provider and
+`provider=None` fail-closed paths, no-unresolved-amounts skip, successful
+extraction repairing an event, fabricated-citation leaving an event
+unresolved, prompt-injection rejection at the orchestration layer, cache-hit
+avoiding a second provider call, provider-error and unhandled-exception
+fallback to no facts (never a crash), and an end-to-end integration pair
+proving a resolved fact clears `forecast.certifiable`/degradation through the
+*unmodified* `state.py`/`recurrence.py`/`forecast.py`/`planner.py` pipeline
+while an unresolved future debit keeps it degraded — the exact seam described
+in the M1 write-up's limitation 2/3.
+
+All new tests build synthetic fixtures via `code/tests/fixtures.py`
+(`edit`/`append`), run entirely offline (`FakeProvider`, injectable
+clock/sleeper — no `time.sleep`, no network, no credentials), and assert
+dataset-directory byte-hash equality before/after to confirm no dataset
+mutation.
+
+### Evaluation run info
+
+Not re-run for M2: the DEV/reporting split, label isolation, and
+`code/evaluation/main.py` scoring are M1/M3 concerns unaffected by this
+milestone, and no provider call (paid or otherwise) has been made against the
+real dataset, per the explicit instruction not to start a paid model run.
+`--mode assisted` was smoke-run against the full 250-request dataset with no
+provider configured only, confirming the fail-closed path and the
+`trace.jsonl`/`usage.json` sidecar writer; those run artifacts were deleted
+after inspection rather than committed, since they contain no facts (every
+row's `provider_status` was `"unavailable"`).
+
+### Evidence and financial safety checks completed
+
+- Retrieved candidate registry is request/user scoped (`data.py`'s existing
+  structural scoping) with the added, documented time-availability cutoff.
+- Every cited source is checked for reality (retrieved-set membership),
+  ownership (same user), and relevance (actually references the target
+  event) before a fact can be accepted.
+- Blank-`request_id` user-level messages are retained and retrievable across
+  that user's requests; verified directly in `RetrievalScopingTests`.
+- A missing/unreadable image amount is never defaulted to zero: an
+  unresolved unknown amount stays `None`, and `state.ExcludedRecord
+  .is_unfunded_obligation` / `Forecast.certifiable` (unmodified) continue to
+  block a positive `amount_safe_to_pay` for an unresolved future debit —
+  proven by the `DeterministicCoreIntegrationTests` pair.
+- Explicit amendment/cancellation facts win over a plain `amount` fact for
+  the same event, with the superseded fact's rejection reason preserved in
+  the trace rather than the fact being dropped.
+- Categories are validated against the actual `schema.EVENT_CATEGORIES`
+  vocabulary only; an invented or ambiguous category is rejected, never
+  silently mapped.
+- Rejecting a citation rejects the entire dependent fact (not a partially
+  accepted amount), and `assist.extract_facts` never lets an unhandled
+  exception propagate into `run_predictions`'s row loop.
+- Prompt-injection text embedded in a message/image is treated as ordinary
+  untrusted content by every check; `resolve_fact`'s citation/relevance/
+  category checks reject an injected claim regardless of its wording, and
+  `extraction_v1.md` documents this instruction to the model as a second,
+  independent layer (not the layer actually relied on for safety).
+
+### Known limitations and degraded cases
+
+1. **No live provider call has been exercised against the real dataset.**
+   `AnthropicProvider` is implemented and unit-constructible (fails closed
+   without a key) but `messages.create` itself has not been called, per the
+   standing instruction not to start a paid model run. `request_03`'s blank
+   salary amount and `request_16`'s unknown rent amount (flagged as M2's job
+   in the M1 write-up) are therefore still open in the current `output.csv`
+   — the mechanism to resolve them is implemented and tested via
+   `FakeProvider`, but resolving those two specific rows requires an actual
+   authorized model run, which this pass does not perform or estimate the
+   cost of.
+2. **`_pick_winner`'s financially-safer tie-break assumes a single value
+   type within a group.** When an explicit group mixes an `amended_amount`
+   (Decimal) and a `cancelled` (bool) fact for the same event and neither is
+   uniquely newest, the direction-based tie-break (`isinstance(..., Decimal)`)
+   does not apply to the boolean case and falls through to `group[0]` (first
+   by no defined order). Not exercised by real or synthetic data seen so far
+   (no fixture produces two *different* explicit fact types for one event in
+   the same call); flagged rather than fixed speculatively, since a
+   synthetic tie-break rule for an unobserved case would be exactly the kind
+   of unsupported invented behavior the milestone prohibits.
+3. **`evaluation/usage_report.md` remains empty.** Unaffected by M2, since no
+   provider call has been made; M4 is responsible for populating it from a
+   real `usage.json` once an authorized run happens.
+4. **`code/evaluation/runs/<timestamp>/` and `code/evaluation/extraction_cache.json`**
+   are created by `--mode assisted`; both were added to `.gitignore` in this
+   pass so an assisted smoke run does not leave artifacts to accidentally commit.
+
+**Next milestone:** M4 packaging (per the explicit instruction, not started
+this pass) — code archive layout, `evaluation/usage_report.md`, and README
+run instructions — plus, at the participant's discretion, an authorized
+paid-model run of `--mode assisted` against the full dataset to attempt
+resolving `request_03`/`request_16` and produce real usage numbers.
+
+**Review requested from Codex:** yes. Worth attacking specifically: the
+availability-cutoff decisions (2, 3) against any real message/image whose
+implications were not obvious from the synthetic fixtures, the conflict-
+grouping fix (decision 5) for any grouping case not covered by
+`ConflictResolutionTests`, whether `BoundedCaller`'s deadline/backoff
+behavior (decision 7) matches the plan's "60 seconds ... three provider
+attempts total" language precisely enough, the cache-key composition
+(decision 8), and limitation 2's unresolved tie-break gap.
+
+---
+
 ## M0 cleanup — response to `docs/reviews/M0_CODE_REVIEW.md` (fix-first, 8 findings)
 
 **Status:** R-M0-01 … R-M0-08 all fixed, all reproduced first, all covered by
@@ -507,6 +798,57 @@ the contract.
 carries more than two decimals, values are preserved exactly but the output
 rendering convention measured from the gold samples would need revisiting before
 publication. It does not fire on the current data.
+
+---
+
+## M2 review response — `docs/reviews/M2_CODE_REVIEW.md` (fix-first, 3 findings)
+
+**Status:** R-M2-01 … R-M2-03 all fixed, all covered by targeted regression
+tests. Verdict accepted in full; no finding disputed.
+
+**Verification:**
+
+```
+$ python -B -m unittest discover -s code/tests -t code -p "test_*.py"
+Ran 249 tests in 8.594s
+OK
+$ python code/main.py --mode deterministic --dataset dataset --out /tmp/det_output.csv
+$ python code/main.py --mode assisted --dataset dataset --out /tmp/assisted_output.csv
+assisted mode provider status: unavailable ...
+$ diff <(sort /tmp/det_output.csv) <(sort /tmp/assisted_output.csv)
+(no output — rows are byte-identical; assisted mode still fails closed
+without credentials)
+```
+
+10 tests added (239 → 249): 3 strict-date fixtures, 1 hanging-provider
+timeout test, 4 `citation_note` unit tests, 2 assisted-mode CLI integration
+tests that read the published `output.csv`.
+
+| Finding | Fix | File | Regression test |
+|---|---|---|---|
+| R-M2-01 evidence dates bypass strict input contract | `evidence.resolve_fact` no longer calls `date.fromisoformat` directly; it now calls a new `data.try_parse_iso_date`, which reuses M0's `^\d{4}-\d{2}-\d{2}$` shape check but returns `None` on failure instead of raising, so an untrusted evidence date can be rejected without crashing the row | `data.py`, `evidence.py` | `test_evidence.py::StrictDateTests` ×3 (compact, ISO-week, well-formed) |
+| R-M2-02 per-row timeout is not a hard wall-clock bound | `BoundedCaller.call` no longer uses `ThreadPoolExecutor`: a hung worker could still block `__exit__`'s `shutdown(wait=True)`, and even `wait=False` would not stop `concurrent.futures.thread`'s `atexit` join hook at interpreter shutdown. Replaced with a daemon `threading.Thread` + `queue.Queue(maxsize=1)` handoff (`_run_with_hard_timeout`): a hung provider call is abandoned on its own daemon thread, which cannot block the caller past `remaining` seconds or block process/interpreter exit | `model.py` | `test_model.py::BoundedCallerTests::test_hanging_provider_never_returns_but_call_still_bounds_wall_clock_time` (real wall-clock, provider that never returns) |
+| R-M2-03 citations never reach `decision_explanation` | Added `evidence.citation_note(trace)`, which re-derives the cited ids from `RowTrace.accepted` filtered against `RowTrace.retrieved` (never trusted from `resolve_fact` alone) and returns `None` — not an empty citation — when nothing was accepted. `main.run_predictions` appends the note to `row["decision_explanation"]` only in assisted mode and only when `accepted_facts` is non-empty | `evidence.py`, `main.py` | `test_evidence.py::CitationNoteTests` ×4; `test_assist.py::CitationReachesOutputTests` ×2 (end-to-end through `main.run_predictions` with a `FakeProvider`, reading the published CSV) |
+
+**No correction to any finding as filed.** All three were reproduced exactly
+as described before being fixed.
+
+**Design note on R-M2-02.** The review's suggested fix ("non-waiting
+shutdown") would not have been sufficient on its own: `ThreadPoolExecutor`
+registers a global `atexit` hook (`concurrent.futures.thread._python_exit`)
+that joins all pending worker threads regardless of how an individual
+executor's `shutdown()` was called, so a hung provider could still hang the
+whole process (or the test suite) at exit. Dropping `ThreadPoolExecutor`
+entirely for this call site, in favor of a plain daemon thread, removes that
+failure mode rather than papering over it.
+
+**Residual scope note on R-M2-03.** The degraded-row explanation branch in
+`output.render_explanation` (used when no evidence resolved an unfunded
+obligation) already states insufficiency in general terms
+("Some obligations could not be quantified from the available records...")
+without naming any id; `citation_note` only ever appends, and only when
+`accepted_facts` is non-empty, so it cannot conflict with or duplicate that
+existing degraded-row language.
 
 ---
 
