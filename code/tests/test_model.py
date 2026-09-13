@@ -122,14 +122,66 @@ class BoundedCallerTests(unittest.TestCase):
             caller.call(provider, make_request(), ledger)
 
     def test_full_run_call_budget_exceeded_raises_on_next_call(self):
+        # M4_BUDGET_REVIEW: check_budget() treats total >= budget as
+        # exhausted, so a budget of 1 must reject the very first call
+        # (0 calls made, budget is 1) -- there is no room for even one
+        # call under a budget that low.
         provider = model_module.FakeProvider(default=model_module.ExtractionResult(
             facts=(), usage=model_module.Usage(calls=1)))
         ledger = model_module.UsageLedger(full_run_call_budget=1)
         clock = FakeClock()
         caller = self.caller(clock)
-        caller.call(provider, make_request("request_01"), ledger)
         with self.assertRaises(model_module.BudgetExceeded):
-            caller.call(provider, make_request("request_02"), ledger)
+            caller.call(provider, make_request("request_01"), ledger)
+
+    def test_call_budget_exhaustion_prevents_any_further_provider_calls(self):
+        """M4 review R-M4-01 / M4_BUDGET_REVIEW: once the ledger is at or
+        over budget, a subsequent row must not place a new paid call at all
+        -- the check must happen *before* `provider.extract`, not only after
+        it records usage, and it must reject at the limit itself (`>=`), not
+        only strictly past it. `total.calls` only grows in whole calls, so
+        the call that lands exactly on the budget is the last one allowed;
+        every row after that must be blocked pre-call."""
+        provider = model_module.FakeProvider(default=model_module.ExtractionResult(
+            facts=(), usage=model_module.Usage(calls=1, input_tokens=1)))
+        ledger = model_module.UsageLedger(full_run_call_budget=2)
+        clock = FakeClock()
+        caller = self.caller(clock)
+
+        caller.call(provider, make_request("request_01"), ledger)  # total=1, within budget
+        self.assertEqual(len(provider.calls), 1)
+
+        with self.assertRaises(model_module.BudgetExceeded):
+            caller.call(provider, make_request("request_02"), ledger)  # lands exactly on budget=2, raises after
+        self.assertEqual(len(provider.calls), 2)
+
+        for request_id in ("request_03", "request_04", "request_05"):
+            with self.assertRaises(model_module.BudgetExceeded):
+                caller.call(provider, make_request(request_id), ledger)
+        # Every row past the budget is blocked pre-call; none reached the provider.
+        self.assertEqual(len(provider.calls), 2)
+
+    def test_token_budget_exhaustion_prevents_any_further_provider_calls(self):
+        """Token usage is only known once a call returns, so the call that
+        first reaches or crosses the token budget necessarily still happens
+        -- but the *next* row, checked before any call, must be blocked
+        outright, and the boundary itself (usage == budget) must count as
+        exhausted, not just usage > budget."""
+        provider = model_module.FakeProvider(default=model_module.ExtractionResult(
+            facts=(), usage=model_module.Usage(calls=1, input_tokens=500)))
+        ledger = model_module.UsageLedger(full_run_token_budget=1000)
+        clock = FakeClock()
+        caller = self.caller(clock)
+
+        caller.call(provider, make_request("request_01"), ledger)  # 500 tokens, within budget
+        self.assertEqual(len(provider.calls), 1)
+        with self.assertRaises(model_module.BudgetExceeded):
+            caller.call(provider, make_request("request_02"), ledger)  # lands exactly on 1000, raises after
+        self.assertEqual(len(provider.calls), 2)  # this row's call still happened; usage was unknown beforehand
+
+        with self.assertRaises(model_module.BudgetExceeded):
+            caller.call(provider, make_request("request_03"), ledger)  # already at/over budget: blocked pre-call
+        self.assertEqual(len(provider.calls), 2)  # request_03 never reached the provider
 
     def test_unclassified_exception_is_not_retried(self):
         provider = model_module.FakeProvider(default=ValueError("boom"))

@@ -317,10 +317,13 @@ class UsageLedger:
         self.per_request[request_id] = self.per_request.get(request_id, Usage()) + usage
 
     def check_budget(self) -> None:
-        if self.full_run_call_budget is not None and self.total.calls > self.full_run_call_budget:
+        # A hard ceiling must reject at the limit itself, not only past it --
+        # `>=` here, not `>` -- otherwise a call that lands exactly on budget
+        # would still let one more call through.
+        if self.full_run_call_budget is not None and self.total.calls >= self.full_run_call_budget:
             raise BudgetExceeded(f"full-run call budget {self.full_run_call_budget} exceeded")
         total_tokens = self.total.input_tokens + self.total.output_tokens
-        if self.full_run_token_budget is not None and total_tokens > self.full_run_token_budget:
+        if self.full_run_token_budget is not None and total_tokens >= self.full_run_token_budget:
             raise BudgetExceeded(f"full-run token budget {self.full_run_token_budget} exceeded")
 
 
@@ -377,6 +380,11 @@ class BoundedCaller:
     clock: Callable[[], float] = time.monotonic
 
     def call(self, provider: Provider, request: ExtractionRequest, ledger: UsageLedger) -> ExtractionResult:
+        # Checked before any call is attempted, not only after: `check_budget`
+        # raising here means the ledger was already over budget from a prior
+        # row, so this row must not place a new paid call at all.
+        ledger.check_budget()
+
         deadline = self.clock() + self.per_row_timeout_seconds
         row_usage = Usage()
         last_error: Optional[Exception] = None

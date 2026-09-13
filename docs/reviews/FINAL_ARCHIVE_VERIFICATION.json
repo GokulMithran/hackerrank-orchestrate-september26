@@ -1,0 +1,11 @@
+{
+  "serialized_contract_errors": [],
+  "rows": 250,
+  "archive_files": 48,
+  "archive_sha256": "4af706001e2e71ce42ac1db453da9b732f1867cf23e9a12a18043343202a462f",
+  "output_sha256": "e445b252d90e158bf51b21f33f6003b5d93014b45aba694cc0a3c35d513cf1fa",
+  "clean_extraction_audit_and_tests": [
+    "\naudit: 0 finding(s), 0 error(s)\n",
+    "assisted-mode trace: C:\\Users\\gokul\\AppData\\Local\\Temp\\tmpwki3jj9_\\code\\evaluation\\runs\\20260913T062538Z\\trace.jsonl\n\nwrote 2 rows to C:\\Users\\gokul\\AppData\\Local\\Temp\\tmpj9j9sjca\\output.csv\nmethod distribution: full_payment=1, not_recommended=1\ndegraded rows      : 1\ngate failures      : 0\nunhandled errors   : 0\nassisted-mode trace: C:\\Users\\gokul\\AppData\\Local\\Temp\\tmpwki3jj9_\\code\\evaluation\\runs\\20260913T062538Z\\trace.jsonl\n\nwrote 2 rows to C:\\Users\\gokul\\AppData\\Local\\Temp\\tmp0ef3367r\\output.csv\nmethod distribution: not_recommended=2\ndegraded rows      : 2\ngate failures      : 0\nunhandled errors   : 0\n..............................................................................................................................................................................................................................................................\n----------------------------------------------------------------------\nRan 254 tests in 17.141s\n\nOK\n"
+  ]
+}

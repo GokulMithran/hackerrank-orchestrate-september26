@@ -255,7 +255,7 @@ class CitationReachesOutputTests(unittest.TestCase):
         out_path = Path(out_dir.name) / "output.csv"
 
         original = main_module._build_assist_config
-        main_module._build_assist_config = lambda dataset_dir: config
+        main_module._build_assist_config = lambda dataset_dir, **kwargs: config
         try:
             main_module.run_predictions(dataset_dir, out_path, mode="assisted",
                                         limit=None, quiet=True)

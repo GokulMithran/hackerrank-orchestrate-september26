@@ -879,3 +879,245 @@ One qualification returned in the other direction: the August evidence F1 of
 0.480 was itself computed on matched held-out pairs, so the low score is a real
 measurement of that run even though my proposed *cause* for it was not
 established. Both statements travel together; neither is a September result.
+
+---
+
+## M4 (in progress) — credibility and package
+
+**Status:** the no-cost parts of M4 are complete: real `--compare-baseline`
+scoring, assisted-mode scoring in the evaluation harness, a code-level README,
+and a packaging script. **Blocked** on the participant: no `ANTHROPIC_API_KEY`
+is set in this environment, so the authorized paid-model run against the full
+250-request dataset — the one thing `evaluation/usage_report.md` and a
+submission-ready `output.csv` from assisted mode depend on — has not
+happened. Per the standing instruction, no paid run is started without
+explicit authorization.
+
+**What changed:**
+
+1. `code/evaluation/main.py` no longer has an unimplemented `--mode assisted`
+   (previously exited 2) or a `--compare-baseline` flag that was accepted but
+   never used. Both now work: `score()` takes a `mode` and calls
+   `main.predict_one` (new, factored out of `main.run_predictions`'s per-row
+   loop) so the evaluation harness scores the *identical* row-production path
+   a real submission publishes from, never a second copy of it.
+   `--compare-baseline` with `--mode assisted` additionally scores the
+   deterministic-only baseline on the same request set immediately after, so
+   the evidence layer's effect is visible request-for-request.
+2. `main.predict_one(data, request_id, mode=..., assist_config=...)` is the
+   one new production function: it returns the row, the decision, gate
+   failures, the evidence trace (assisted only), and whether the row crashed.
+   `run_predictions` now calls it per request instead of inlining the same
+   logic, so the CLI and the evaluator cannot silently diverge.
+3. `code/README.md` added: setup (optional `anthropic` install, `ANTHROPIC_API_KEY`
+   from the environment only), run commands for all three modes, the test
+   command, and the evaluation commands including `--compare-baseline`.
+4. `code/package.py` added: builds `code.zip` from an explicit allowlist
+   (`main.py`, `buy_or_wait/`, `prompts/`, `evaluation/`, `tests/`,
+   `README.md`), rooted so the archive contains `evaluation/usage_report.md`
+   directly rather than nested under `code/`, per plan §9. Excludes
+   `__pycache__`, `code/evaluation/runs/`, and `extraction_cache.json`. Warns
+   (does not fail) if `usage_report.md` is still empty, and fails if the
+   archive doesn't contain it at the expected root path. Verified: 41 files
+   packaged, correct root-relative paths, warning fires correctly against the
+   still-empty placeholder.
+5. `code.zip` added to `.gitignore` — it is a generated submission artifact.
+
+**Tests:** `code/tests/test_eval_main.py` added (3 tests, 249 -> 252):
+scoring a fixture's one gold sample via `score()` matches `predict_one`'s
+published row exactly; assisted mode with no provider configured produces
+byte-identical scoring output to deterministic mode; a CLI-level test against
+the real dataset's frozen split confirms `--mode assisted --compare-baseline`
+prints both an `ASSISTED` and a `BASELINE` section.
+
+```
+$ python -B -m unittest discover -s code/tests -t code -p "test_*.py"
+Ran 252 tests in ~11.7s          OK
+
+$ python code/evaluation/main.py --split report --mode assisted --compare-baseline
+assisted mode provider status: unavailable (no API key/package)
+------------------ ASSISTED ------------------ ... (scores identical to baseline)
+===== BASELINE (deterministic, no model calls) FOR COMPARISON =====
+------------------ BASELINE ------------------ ... (identical numbers, confirming fail-closed parity)
+
+$ python code/package.py
+WARNING: evaluation/usage_report.md is empty. ...
+wrote <repo>/code.zip
+41 files: ...
+```
+
+**What is still blocked on the participant, not on code:**
+
+1. **`evaluation/usage_report.md` is still empty**, correctly — per the plan,
+   it must reflect the final full-dataset run and must never be pre-filled
+   with invented numbers. Populating it requires an authorized paid run of
+   `--mode assisted` against the full 250-request dataset with a real
+   `ANTHROPIC_API_KEY` set, which has not been started.
+2. **`output.csv` at the repo root is still the deterministic/M3 baseline.**
+   Producing a submission-ready assisted-mode `output.csv` (to attempt
+   resolving `request_03`/`request_16`, per the M2 write-up) requires the
+   same authorized run.
+3. **`code.zip` has not been produced as a submission artifact** — `package.py`
+   works and was smoke-tested, but building the real archive should happen
+   after the usage report is populated, not before, so it isn't rebuilt twice.
+
+**Next step:** participant decision required — either (a) set
+`ANTHROPIC_API_KEY` and authorize a bounded-cost run of
+`python code/main.py --mode assisted --out output.csv` against the full
+dataset, after which `usage_report.md` is generated from the real
+`code/evaluation/runs/<timestamp>/usage.json` and `code.zip` is built, or
+(b) submit on the deterministic/M3 baseline `output.csv` with
+`usage_report.md` documenting zero model calls, which is honest but forgoes
+the two known evidence-dependent rows.
+
+**Review requested from Codex:** yes, on the diff described above
+(`predict_one` factoring, `score()`/`--compare-baseline` semantics,
+`package.py`'s allowlist and root-path check) — independent of the pending
+paid-run decision.
+
+## M4 review response — R-M4-01 (full-run budget wiring)
+
+Source: `docs/reviews/M4_CODE_REVIEW.md`. Blocking finding: `_build_assist_config()`
+constructed `UsageLedger()` with both full-run budgets `None`, so a 250-row
+paid run had no cost ceiling; per-row limits existed but `UsageLedger.check_budget()`
+was only ever called *after* `ledger.record(...)` inside `BoundedCaller.call`,
+so it could never prevent the *next* row's call once budget was already
+exceeded — it only raised retroactively, after that row had already paid for
+a call.
+
+**Fix (disposition: fixed, not disputed):**
+
+1. `code/buy_or_wait/model.py` — `BoundedCaller.call()` now calls
+   `ledger.check_budget()` once at the top, before any attempt is made. Once
+   the ledger is already over budget, every subsequent row raises
+   `BudgetExceeded` before touching the provider. The one call that first
+   crosses a threshold still executes, because usage (tokens) and the
+   post-call count are unknowable before that call returns — this is
+   inherent to token budgets and applied uniformly to call-count budgets too,
+   which is simpler than special-casing them separately.
+2. `code/main.py` — added `DEFAULT_FULL_RUN_CALL_BUDGET = 60`,
+   `DEFAULT_FULL_RUN_TOKEN_BUDGET = 300_000`, env vars
+   `BUY_OR_WAIT_MAX_CALLS` / `BUY_OR_WAIT_MAX_TOKENS`, and CLI flags
+   `--max-calls` / `--max-tokens`. `_resolve_budget()` resolves CLI > env >
+   default, so assisted mode can never run with an unbounded ledger.
+   `_build_assist_config()` now takes `max_calls`/`max_tokens` and builds
+   `UsageLedger(full_run_call_budget=..., full_run_token_budget=...)`.
+   `run_predictions()` prints `assisted mode full-run budget: N calls, M
+   tokens` alongside the provider-status line, and `usage.json` now records
+   `full_run_call_budget`/`full_run_token_budget`.
+3. `code/evaluation/main.py` — mirrors the same budget line in its
+   assisted-mode setup so `--compare-baseline` runs show the same ceiling.
+4. `code/tests/test_model.py` — added
+   `test_call_budget_exhaustion_prevents_any_further_provider_calls` and
+   `test_token_budget_exhaustion_prevents_any_further_provider_calls`, both
+   asserting `provider.calls` stops growing once the ledger is over budget
+   (the crossing call still lands; every call after it is blocked pre-call).
+5. `code/tests/test_assist.py` — the `_build_assist_config` monkeypatch
+   lambda needed `**kwargs` to accept the new `max_calls`/`max_tokens`
+   arguments.
+
+**Model ID:** `claude-sonnet-5` is confirmed valid — this implementation is
+itself running on that model per the harness's own system information, so no
+separate account check against the Anthropic API is needed to answer that
+question.
+
+**Verification:**
+
+```text
+$ python -B -m unittest discover -s code/tests -t code -p "test_*.py"
+Ran 254 tests in 11.5s
+OK
+```
+
+**Still blocked on participant decision, unchanged from above:** no
+`ANTHROPIC_API_KEY` is set in this environment. Wiring and tests are
+complete and offline-verified; a real (even small, budget-capped) smoke
+batch against the Anthropic API requires the participant to supply a key and
+explicitly authorize the spend before any paid call is made.
+
+**Review requested from Codex:** yes, on the `check_budget()` placement,
+the CLI/env/default precedence, and the two new regression tests.
+
+## M4 review response — R-M4-02 (budget boundary: `>=` not `>`)
+
+Source: `docs/reviews/M4_BUDGET_REVIEW.md`. Fix-first finding: `UsageLedger.check_budget()`
+rejected only when `total > budget`, so usage landing exactly on the configured
+ceiling let one further provider call through before the *next* call's
+pre-check caught it — an off-by-one overshoot of a "hard" ceiling.
+
+**Fix (disposition: fixed, not disputed):**
+
+1. `code/buy_or_wait/model.py` — `check_budget()` now rejects at
+   `total.calls >= full_run_call_budget` and
+   `total_tokens >= full_run_token_budget`, applied uniformly to both the
+   pre-call guard and the post-call guard in `BoundedCaller.call()` (both call
+   the same `check_budget()`). Consequence: the call whose own usage lands
+   exactly on the ceiling is still attempted (usage is unknowable
+   beforehand) but its result is discarded via the post-call check, and every
+   row after that is blocked pre-call. A budget of `N` therefore guarantees
+   at most `N-1` calls' worth of usage is ever returned to a caller, never
+   `N` or more.
+2. `code/tests/test_model.py` — updated
+   `test_full_run_call_budget_exceeded_raises_on_next_call` (budget=1: the
+   pre-call check only sees usage *before* this call, so the first call still
+   executes, but the post-call check then sees `1 >= 1` and discards its
+   result) and rewrote both R-M4-01
+   regression tests (`test_call_budget_exhaustion_prevents_any_further_provider_calls`,
+   `test_token_budget_exhaustion_prevents_any_further_provider_calls`) to
+   assert the corrected boundary: the call landing exactly on budget still
+   reaches the provider but raises `BudgetExceeded` instead of returning a
+   result, and every call after that is blocked before reaching the provider
+   at all.
+
+**Verification:**
+
+```text
+$ python -B -m unittest discover -s code/tests -t code -p "test_*.py"
+Ran 254 tests in ~12s
+OK
+```
+
+**Separately found and fixed while verifying this response (not part of
+either Codex review, self-detected):**
+
+1. **Test isolation gap in `code/tests/test_eval_main.py::CompareBaselineCliTests`.**
+   This test asserts the no-provider fallback path but never forced the
+   no-key condition itself -- it only worked because the ambient environment
+   happened to lack `ANTHROPIC_API_KEY`. After wiring optional `.env`
+   auto-loading into `main.py`/`evaluation/main.py` (see below) and the
+   participant adding a real key to their local `.env`, this test started
+   constructing a real, configured `AnthropicProvider` and would have made
+   real Anthropic calls against the dev split on every test run. Fixed by
+   adding `setUp`/`addCleanup` to the test that explicitly pops
+   `ANTHROPIC_API_KEY` from the environment before calling `eval_main.main()`
+   and restores it afterward, so the assertion no longer depends on what the
+   developer's `.env` happens to contain. Audited every other assisted-mode
+   test in the suite (`test_assist.py`, remaining `test_eval_main.py` tests)
+   and confirmed they either pass `assist_config` explicitly or monkeypatch
+   `_build_assist_config`, so none of them are exposed to this gap.
+2. **`.env` support added.** `code/main.py` and `code/evaluation/main.py` now
+   call `load_dotenv(REPO_ROOT / ".env")` at import time if `python-dotenv`
+   is installed (a no-op, silently skipped otherwise); `.env.example` and a
+   local (gitignored) `.env` were added per the participant's request so
+   `ANTHROPIC_API_KEY` can be set without exporting it in the shell.
+   `code/README.md` documents this.
+3. **Root `output.csv` was found truncated to a single row** (`request_26`
+   only) from an earlier interrupted real-dataset run recorded at
+   `code/evaluation/runs/20260913T033628Z/` -- that run's trace shows
+   `"provider_status":"unavailable"`, confirming no model call was made and
+   no cost was incurred; the file was simply left mid-write. Restored by
+   rerunning `python code/main.py --mode deterministic --out output.csv`
+   (no network access possible in this mode regardless of credentials),
+   which reproduced the full, previously-committed 250-row baseline exactly
+   (`git diff --stat output.csv` empty after regeneration). Stray
+   `code/evaluation/runs/<timestamp>/` directories created by this session's
+   test and debug runs were deleted (gitignored, never committed).
+
+**Still blocked on participant decision, unchanged:** a real `ANTHROPIC_API_KEY`
+is now present in the participant's local `.env`, but no assisted-mode run
+against the real dataset has been made with it, and none will be made without
+explicit authorization for the specific run (smoke batch or full dataset).
+
+**Review requested from Codex:** yes, on the `>=` boundary fix and the
+corrected regression tests; the test-isolation and `.env`/output.csv items
+are disclosed for awareness rather than requested as a formal review target.

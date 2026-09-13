@@ -10,3 +10,4 @@ __pycache__/
 .serena/
 code/evaluation/runs/
 code/evaluation/extraction_cache.json
+code.zip

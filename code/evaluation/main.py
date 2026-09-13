@@ -2,18 +2,21 @@
 
     python code/evaluation/main.py --show-split
     python code/evaluation/main.py --split dev    --mode deterministic
-    python code/evaluation/main.py --split report --compare-baseline
+    python code/evaluation/main.py --split report --mode assisted --compare-baseline
 
 Every run prints an audit header first: which script ran, which dataset and
 split manifest (with its fingerprint), how many rows, which subset, the
 disjointness result, and the system under test. A reader must be able to tell
 what was measured without opening the code.
 
-Milestone status: M0 owns the frozen split manifest and this header. Scoring
-arrives with the financial engine (M1) -- until then the scoring modes exit 2
-rather than printing a metric that no implementation produced.
+Milestone status: both `--mode deterministic` and `--mode assisted` are scored
+via `main.predict_one`, the identical per-row path `main.py` publishes from.
+`--compare-baseline` additionally scores the deterministic-only baseline on
+the same subset when `--mode assisted` is selected, so the evidence layer's
+effect is visible request-for-request rather than inferred from two separate
+runs.
 
-Exit codes: 0 success, 1 dataset/split error, 2 not implemented yet.
+Exit codes: 0 success, 1 dataset/split error.
 """
 from __future__ import annotations
 
@@ -23,12 +26,18 @@ from pathlib import Path
 
 CODE_DIR = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(CODE_DIR))  # make `buy_or_wait` and `evaluation` importable
+REPO_ROOT = CODE_DIR.parent
+
+try:  # optional: load ANTHROPIC_API_KEY etc. from a repo-root .env if present
+    from dotenv import load_dotenv
+    load_dotenv(REPO_ROOT / ".env")
+except ImportError:
+    pass
 
 from buy_or_wait.data import DataError, file_sha256, load_dataset  # noqa: E402
-from buy_or_wait.output import to_row  # noqa: E402
 from evaluation import metrics  # noqa: E402
 from evaluation.labels import load_labels, sample_exposure_note  # noqa: E402
-from main import decide_one  # noqa: E402
+from main import _build_assist_config, predict_one  # noqa: E402
 from evaluation.splits import (  # noqa: E402
     MANIFEST_PATH,
     SplitError,
@@ -36,9 +45,7 @@ from evaluation.splits import (  # noqa: E402
     manifest_fingerprint,
 )
 
-REPO_ROOT = CODE_DIR.parent
 DEFAULT_DATASET = REPO_ROOT / "dataset"
-NOT_IMPLEMENTED = 2
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -114,39 +121,56 @@ def main(argv: list[str] | None = None) -> int:
             print("\nPass --split dev or --split report to score a subset.")
         return 0
 
+    assist_config = None
     if args.mode == "assisted":
-        print("--mode assisted needs the evidence layer (M2); not implemented yet.",
-              file=sys.stderr)
-        return NOT_IMPLEMENTED
+        assist_config = _build_assist_config(args.dataset)
+        print(f"assisted mode provider status: "
+              f"{'unavailable (no API key/package)' if assist_config.provider is None else 'configured'}")
+        print(f"assisted mode full-run budget: {assist_config.ledger.full_run_call_budget} calls, "
+              f"{assist_config.ledger.full_run_token_budget} tokens")
 
-    return score(data, rows, labels, verbose=args.verbose)
+    result = score(data, rows, labels, mode=args.mode, assist_config=assist_config,
+                  verbose=args.verbose, label="ASSISTED" if args.mode == "assisted" else "DETERMINISTIC")
+
+    if args.compare_baseline and args.mode == "assisted":
+        print("\n===== BASELINE (deterministic, no model calls) FOR COMPARISON =====")
+        score(data, rows, labels, mode="deterministic", assist_config=None,
+             verbose=args.verbose, label="BASELINE")
+
+    return result
 
 
-def score(data, request_ids, labels, *, verbose: bool = False) -> int:
-    """Score the deterministic engine against the labels for `request_ids`."""
+def score(data, request_ids, labels, *, mode: str = "deterministic",
+         assist_config=None, verbose: bool = False, label: str = "RESULTS") -> int:
+    """Score `mode` (deterministic or assisted) against labels for `request_ids`.
+
+    Calls `main.predict_one` -- the same per-row path `main.py` publishes from
+    -- so a scored row and a submitted row can never diverge in how they were
+    produced.
+    """
     statuses: list[tuple[str, str]] = []
     methods: list[tuple[str, str]] = []
     amounts: list[tuple[str, str, str]] = []
     plans: list[tuple[str, str]] = []
     dates: list[tuple[str, str]] = []
     degraded = 0
+    crashed = 0
     mismatches: list[str] = []
 
     for request_id in request_ids:
-        request = data.requests_by_id[request_id]
-        context = data.context_for(request_id)
-        decision, failures = decide_one(context, data.rates_by_key)
-        row = to_row(decision, context.profile.home_currency, request.requested_amount,
-                     context.profile.minimum_balance_to_keep)
+        result = predict_one(data, request_id, mode=mode, assist_config=assist_config)
+        row, decision = result["row"], result["decision"]
         gold = labels[request_id]
+        currency = data.profiles_by_user[data.requests_by_id[request_id].user_id].home_currency
 
         statuses.append((row["affordability_status"], gold.affordability_status))
         methods.append((row["recommended_payment_method"], gold.recommended_payment_method))
-        amounts.append((context.profile.home_currency, row["amount_safe_to_pay"],
-                        gold.amount_safe_to_pay))
+        amounts.append((currency, row["amount_safe_to_pay"], gold.amount_safe_to_pay))
         plans.append((row["payment_plan"], gold.payment_plan))
         dates.append((row["earliest_date_for_full_payment"], gold.earliest_date_for_full_payment))
-        if decision.degraded:
+        if result["crashed"]:
+            crashed += 1
+        elif decision.degraded:
             degraded += 1
         if row["recommended_payment_method"] != gold.recommended_payment_method:
             mismatches.append(
@@ -163,7 +187,7 @@ def score(data, request_ids, labels, *, verbose: bool = False) -> int:
     date_exact, _ = metrics.exact_match(dates)
     mean_days, compared, both_empty, emptiness_mismatch = metrics.date_day_error(dates)
 
-    print("\n------------------ RESULTS ------------------")
+    print(f"\n------------------ {label} ------------------")
     print(f"affordability_status      : {correct_status}/{total}  "
           f"macro-F1 {metrics.macro_f1(statuses):.3f}")
     print(f"recommended_payment_method: {correct_method}/{total}  "
@@ -173,6 +197,8 @@ def score(data, request_ids, labels, *, verbose: bool = False) -> int:
           f"(mean |days| {mean_days:.1f} over {compared}; both-empty {both_empty}; "
           f"emptiness disagreement {emptiness_mismatch})")
     print(f"degraded rows             : {degraded}/{total}  (counted as wrong, never dropped)")
+    if crashed:
+        print(f"unhandled row errors      : {crashed}/{total}  (counted as wrong, never dropped)")
 
     print("\namount_safe_to_pay by currency (never pooled):")
     for currency, stats in metrics.amount_error_by_currency(amounts).items():
@@ -182,7 +208,7 @@ def score(data, request_ids, labels, *, verbose: bool = False) -> int:
     print(f"\nstatus confusion (gold->pred): {dict(metrics.confusion(statuses))}")
     print(f"method confusion (gold->pred): {dict(metrics.confusion(methods))}")
     if mismatches:
-        print("\n---------------- METHOD MISMATCHES ----------------")
+        print(f"\n---------------- {label} METHOD MISMATCHES ----------------")
         for line in mismatches:
             print(line)
     return 0
