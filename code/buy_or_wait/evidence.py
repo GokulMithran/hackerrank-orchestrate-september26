@@ -11,13 +11,15 @@ word on whether a resulting row may be published.
 """
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass, field, replace
 from datetime import date, datetime
 from decimal import Decimal, InvalidOperation
 from typing import Iterable, Mapping, Optional
 
+from . import fx
 from .data import try_parse_iso_date
-from .schema import EVENT_CATEGORIES, FinancialEvent, RequestContext
+from .schema import EVENT_CATEGORIES, ExchangeRate, FinancialEvent, RequestContext
 
 # --------------------------------------------------------------- retrieval ---
 
@@ -112,6 +114,25 @@ def available_candidates(refs: Iterable[EvidenceRef]) -> dict[str, EvidenceRef]:
 #: this is not an open vocabulary a prompt can extend at run time.
 VALID_FACT_FIELDS = frozenset({"amount", "category", "cancelled", "amended_amount"})
 
+#: `cancelled` and `amended_amount` change what an existing structured event
+#: means (its status or its amount), not merely fill in a currently-unknown
+#: value the way `amount` repair does. Codex's Phase A fourth-pass review
+#: (docs/reviews/PHASE_A_FOURTH_PASS_REVIEW.md) reproduced two concrete
+#: failures even after several corrective passes closed the negation/
+#: conditional/self-citation/currency holes: a matching number can describe
+#: something other than the replacement amount ("the amendment processing
+#: fee is ZAR 1"), and a completed-effect sentence can name a different
+#: object than the target event ("your cancellation request has been
+#: cancelled; the payment remains due"). Both require binding the claimed
+#: effect to its correct referent, not just detecting that the effect
+#: occurred somewhere in the message -- a check this engine does not yet
+#: have. Rather than keep patching individual adversarial phrasings, these
+#: two fields are disabled by default: the rest of the validation pipeline
+#: still runs (and is still exercised by tests, since it remains the
+#: foundation a future stricter validator would build on), but no mutation
+#: reaches "accepted" while this flag is `False`.
+ALLOW_EVENT_MUTATIONS = False
+
 
 @dataclass(frozen=True)
 class ProposedFact:
@@ -143,6 +164,7 @@ class ExtractedFact:
     status: str  # "accepted" | "rejected"
     reason: Optional[str] = None
     source_span: str = ""
+    conversion_note: Optional[str] = None
 
 
 def _reject(proposed: ProposedFact, reason: str) -> ExtractedFact:
@@ -189,6 +211,14 @@ def align_category(raw: str) -> tuple[Optional[str], Optional[str]]:
     return None, f"{value!r} is not an exact event category"
 
 
+#: One contiguous numeric run: digits optionally grouped/decimalled by `.`/`,`.
+#: A gap (space, word, "of", ...) between two such runs means the source text
+#: names more than one number -- e.g. "2 invoices of INR 500" -- and
+#: concatenating their digits into one value would silently invent an amount
+#: no one actually stated.
+_NUMBER_RUN = re.compile(r"\d[\d.,]*")
+
+
 def parse_fact_amount(raw: str) -> Optional[Decimal]:
     """Parse a free-text numeric value, tolerating two real-world conventions:
     `1,234.56` (comma group / dot decimal) and `1.234,56` (dot group / comma
@@ -198,6 +228,13 @@ def parse_fact_amount(raw: str) -> Optional[Decimal]:
     """
     text = (raw or "").strip()
     if not text:
+        return None
+    runs = _NUMBER_RUN.findall(text)
+    if len(runs) > 1:
+        # More than one numeric run -- even equal ones, e.g. "500 plus 500" --
+        # names more than one number. Concatenating occurrences (not just
+        # distinct values) into a single figure would invent an amount no one
+        # stated.
         return None
     cleaned = "".join(ch for ch in text if ch.isdigit() or ch in ".,-")
     if not cleaned or cleaned.count("-") > 0:
@@ -222,6 +259,207 @@ def parse_fact_amount(raw: str) -> Optional[Decimal]:
     return value
 
 
+#: Relatedness (a message/image linked to the target event) proves the source
+#: is *about* that event, not that it states a cancellation or amendment --
+#: an unrelated payslip notice can be linked to the same salary event it is
+#: silent on. These keyword sets are the minimum lexical evidence a cited
+#: message must actually contain before such a claim is authorized.
+_CANCELLATION_KEYWORDS = (
+    "cancel", "void", "revers", "refund", "terminat", "stopp", "withdraw",
+)
+_AMENDMENT_KEYWORDS = (
+    "amend", "correct", "revis", "instead of", "changed to", "updated to",
+    "adjust", "settled for", "actual amount", "corrected to",
+)
+
+#: Exact bare-verb forms used only to detect an imperative/instruction
+#: sentence ("Please cancel this payment.") -- a subjectless directive
+#: telling someone to perform the effect is not a statement that the
+#: effect already happened. Deliberately narrower and exact-word-matched
+#: (unlike the stems above) so nouns such as "Correction:" are not
+#: misclassified as a command to "correct".
+_IMPERATIVE_VERBS_BY_KEYWORDS = {
+    _CANCELLATION_KEYWORDS: (
+        "cancel", "void", "refund", "terminate", "stop", "withdraw", "reverse",
+    ),
+    _AMENDMENT_KEYWORDS: (
+        "amend", "correct", "revise", "adjust", "change", "update",
+    ),
+}
+
+#: Cancellation has no accompanying number to cross-check (unlike an
+#: amendment, which must separately state the exact proposed amount), so a
+#: keyword mention that merely survives the negation/conditional/uncertainty
+#: denylist is not enough: "The cancellation policy is attached." and
+#: "Cancellation failed." both contain the keyword and trip none of those
+#: markers, yet neither states that the payment was actually cancelled. For
+#: this field only, require the completed-effect grammar itself --
+#: auxiliary/copula directly followed by the participle -- as a positive
+#: precondition rather than defaulting to acceptance whenever nothing bad
+#: was found.
+_CANCELLATION_COMPLETION_PATTERN = re.compile(
+    r"\b(?:has been|have been|was|were|is|are)\s+"
+    r"(?:successfully\s+|already\s+|now\s+)?"
+    r"(?:cancell?ed|voided|reversed|refunded|terminated|stopped|withdrawn)\b",
+    re.IGNORECASE,
+)
+_POSITIVE_PATTERN_BY_KEYWORDS = {
+    _CANCELLATION_KEYWORDS: _CANCELLATION_COMPLETION_PATTERN,
+}
+
+
+def _message_text(context: RequestContext, source_id: str) -> Optional[str]:
+    for message in context.messages:
+        if message.message_id == source_id:
+            return message.message_text
+    return None
+
+
+#: A cited source's keyword match only identifies which sentence to inspect.
+#: A keyword-bearing sentence still does not authorize a cancellation or
+#: amendment if it is negated ("has not been cancelled"), conditional
+#: ("if you cancel"), or describes an uncertain/future/pending effect
+#: ("refund is pending") rather than a stated, completed one.
+#: Split on sentence punctuation, but never between two digits: a decimal
+#: point in "900.50" must survive so amount binding sees the complete
+#: number, not a truncated "900". A `.` (or `;!?`) counts as a splitter
+#: whenever it is not both preceded and followed by a digit.
+_SENTENCE_SPLIT = re.compile(r"(?<!\d)[.;!?\n]+|[.;!?\n]+(?!\d)")
+_NEGATION_MARKERS = (" not ", "n't", " never ", "no longer", " without ")
+_CONDITIONAL_MARKERS = (
+    "if ", "in case", "unless ", "should ", "would ", "were to", "provided that",
+)
+_UNCERTAIN_MARKERS = (
+    "pending", "will be", "may ", "might ", "considering", "requested",
+    "next month", "next week", "upcoming", "planned", "expected to", "about to",
+)
+
+
+def _sentences(text: str) -> list[str]:
+    """Split `text` into sentences on `_SENTENCE_SPLIT` boundaries.
+
+    A trailing `?` is kept (unlike plain `re.split`, which would discard
+    it) so question detection downstream can see it. Trailing `.`/`;`/`!`
+    terminators are dropped instead of kept flush against the sentence's
+    last word/digit, so a sentence-ending period right after a number
+    (e.g. "...ZAR 900.50.") is never mistaken for part of that number.
+    """
+    sentences = []
+    start = 0
+    for match in _SENTENCE_SPLIT.finditer(text):
+        piece = text[start:match.end()].strip()
+        if piece:
+            sentences.append(piece.rstrip(".;!\n") or piece)
+        start = match.end()
+    tail = text[start:].strip()
+    if tail:
+        sentences.append(tail)
+    return sentences
+
+
+def _is_question(sentence: str) -> bool:
+    return "?" in sentence
+
+
+def _is_imperative_instruction(sentence: str, keywords: tuple[str, ...]) -> bool:
+    """`True` if `sentence` is a subjectless directive to perform the effect
+    ("Please cancel this payment.") rather than a statement that the effect
+    already occurred. Matched on the exact bare verb at the very start of
+    the sentence (after an optional "please"/"kindly"), never on the topic
+    stems in `keywords`, so nouns like "Correction:" are not mistaken for
+    the command "correct"."""
+    imperative_verbs = _IMPERATIVE_VERBS_BY_KEYWORDS.get(keywords, ())
+    if not imperative_verbs:
+        return False
+    stripped = re.sub(r"^(please|kindly)\s+", "", sentence.strip(), flags=re.IGNORECASE)
+    first_word_match = re.match(r"[A-Za-z]+", stripped)
+    if not first_word_match:
+        return False
+    return first_word_match.group(0).lower() in imperative_verbs
+
+
+def _is_affirmative_effect_sentence(sentence: str, keywords: tuple[str, ...]) -> bool:
+    if _is_question(sentence):
+        return False
+    if _is_imperative_instruction(sentence, keywords):
+        return False
+    positive_pattern = _POSITIVE_PATTERN_BY_KEYWORDS.get(keywords)
+    if positive_pattern is not None and not positive_pattern.search(sentence):
+        return False
+    lowered = f" {sentence.lower()} "
+    if any(marker in lowered for marker in _NEGATION_MARKERS):
+        return False
+    if any(marker in lowered for marker in _CONDITIONAL_MARKERS):
+        return False
+    if any(marker in lowered for marker in _UNCERTAIN_MARKERS):
+        return False
+    return True
+
+
+def _affirmative_sentence(text: str, keywords: tuple[str, ...]) -> Optional[str]:
+    """The first sentence in `text` that both names the effect (a keyword)
+    and actually states it happened -- not merely mentions it in passing,
+    negated, conditional, interrogative, instructional, or still-pending
+    form."""
+    for sentence in _sentences(text):
+        lowered = sentence.lower()
+        if not any(keyword in lowered for keyword in keywords):
+            continue
+        if _is_affirmative_effect_sentence(sentence, keywords):
+            return sentence
+    return None
+
+
+def _find_supporting_sentence(
+    context: RequestContext, source_ids: Iterable[str], keywords: tuple[str, ...],
+    source_span: str,
+) -> Optional[str]:
+    """The qualifying sentence backing the claimed effect, or `None`.
+
+    Ground truth wins: if any cited source is a message (real `message_text`
+    on file), that text -- not the model's own `source_span` -- decides the
+    outcome, so a fabricated or over-eager quote can never override what the
+    real message actually says. Only when no cited source has retrievable
+    ground-truth text (for example, an image-only citation, where this
+    engine has no independently verifiable text) does the model's own quoted
+    `source_span` get considered at all.
+    """
+    ground_truth_checked = False
+    for source_id in source_ids:
+        text = _message_text(context, source_id)
+        if text is None:
+            continue
+        ground_truth_checked = True
+        sentence = _affirmative_sentence(text, keywords)
+        if sentence is not None:
+            return sentence
+    if ground_truth_checked:
+        return None
+    return _affirmative_sentence(source_span, keywords)
+
+
+#: A three-letter currency code inside the supporting sentence, used to bind
+#: a proposed amendment to the currency actually stated (not just any
+#: currency the model happens to propose).
+_CURRENCY_CODE = re.compile(r"\b[A-Z]{3}\b")
+
+
+def _sentence_states_amount(
+    sentence: str, proposed_amount: Decimal, proposed_currency: Optional[str],
+) -> bool:
+    """`True` only if the supporting sentence itself states the exact amount
+    (and currency, when the sentence names one) being proposed. A keyword
+    like "corrected to" proves an amendment happened, not what number it
+    changed the amount to -- that number must come from the same sentence."""
+    stated_amount = parse_fact_amount(sentence)
+    if stated_amount is None or stated_amount != proposed_amount:
+        return False
+    stated_currencies = set(_CURRENCY_CODE.findall(sentence))
+    if proposed_currency and stated_currencies and proposed_currency.upper() not in stated_currencies:
+        return False
+    return True
+
+
 def _related_event_id(context: RequestContext, source_id: str) -> Optional[str]:
     for message in context.messages:
         if message.message_id == source_id:
@@ -238,6 +476,7 @@ def resolve_fact(
     candidates: Mapping[str, EvidenceRef],
     context: RequestContext,
     events_by_id: Mapping[str, FinancialEvent],
+    rates_by_key: Mapping[tuple[date, str, str], ExchangeRate] = {},
 ) -> ExtractedFact:
     """Validate one proposed fact end to end: citation, scope, relevance,
     category/amount typing. Returns `accepted` only if every check passes."""
@@ -248,19 +487,59 @@ def resolve_fact(
     if citation_error:
         return _reject(proposed, citation_error)
 
+    target_event: Optional[FinancialEvent] = None
     if proposed.target_scope == "event":
-        event = events_by_id.get(proposed.target_event_id or "")
-        if event is None or event.user_id != context.request.user_id:
+        target_event = events_by_id.get(proposed.target_event_id or "")
+        if target_event is None or target_event.user_id != context.request.user_id:
             return _reject(proposed, "target event is not in this request's scope")
-        relevant = any(
-            source_id == event.event_id or _related_event_id(context, source_id) == event.event_id
-            for source_id in proposed.source_ids
-        )
-        if not relevant:
-            return _reject(proposed, f"cited source(s) do not support event {event.event_id}")
-    elif proposed.target_scope != "user_level":
+        relevant_sources = [
+            source_id for source_id in proposed.source_ids
+            if source_id == target_event.event_id
+            or _related_event_id(context, source_id) == target_event.event_id
+        ]
+        if not relevant_sources:
+            return _reject(proposed, f"cited source(s) do not support event {target_event.event_id}")
+        if proposed.field in ("cancelled", "amended_amount"):
+            # The event row itself is the thing being changed, not proof of the
+            # change -- a cancellation/amendment needs a message or image that
+            # actually says so, not merely a citation of the row it targets.
+            supporting = [s for s in relevant_sources if s != target_event.event_id]
+            if not supporting:
+                return _reject(
+                    proposed,
+                    f"event {target_event.event_id} cannot cite itself as proof of its own "
+                    f"{proposed.field}",
+                )
+            keywords = _CANCELLATION_KEYWORDS if proposed.field == "cancelled" else _AMENDMENT_KEYWORDS
+            sentence = _find_supporting_sentence(context, supporting, keywords, proposed.source_span)
+            if sentence is None:
+                return _reject(
+                    proposed,
+                    f"cited source(s) are linked to event {target_event.event_id} but do not "
+                    f"affirmatively state a {proposed.field.replace('_', ' ')} (negated, "
+                    f"conditional, or pending language does not authorize it)",
+                )
+            if proposed.field == "amended_amount":
+                # The keyword only proves an amendment happened; it does not
+                # prove the model's proposed number is the one the sentence
+                # actually states. Bind them before accepting the change.
+                proposed_amount = parse_fact_amount(proposed.value)
+                if proposed_amount is None or not _sentence_states_amount(
+                    sentence, proposed_amount, proposed.currency
+                ):
+                    return _reject(
+                        proposed,
+                        f"cited source(s) do not state the proposed amended amount "
+                        f"{proposed.value!r}",
+                    )
+    elif proposed.target_scope == "user_level":
+        if proposed.target_event_id is not None:
+            return _reject(proposed, "user_level facts must not carry an event target")
+    else:
         return _reject(proposed, f"unsupported target_scope {proposed.target_scope!r}")
 
+    fact_currency = proposed.currency
+    conversion_note: Optional[str] = None
     if proposed.field == "category":
         aligned, reason = align_category(proposed.value)
         if aligned is None:
@@ -270,6 +549,25 @@ def resolve_fact(
         amount = parse_fact_amount(proposed.value)
         if amount is None:
             return _reject(proposed, f"{proposed.value!r} is not a parseable amount")
+        if proposed.currency and target_event is not None and proposed.currency != target_event.currency:
+            try:
+                converted = fx.convert(
+                    amount, from_currency=proposed.currency, to_currency=target_event.currency,
+                    on_date=target_event.settlement_date, rates=rates_by_key,
+                )
+            except fx.RateUnavailable:
+                return _reject(
+                    proposed,
+                    f"{proposed.currency!r} does not match event currency "
+                    f"{target_event.currency!r} and no exact dated rate is available",
+                )
+            # The stored value is now in the event's currency, not the
+            # currency the model proposed -- the fact's `currency` and any
+            # provenance note must say so, never keep silently reporting the
+            # pre-conversion denomination alongside a converted figure.
+            conversion_note = f"{amount} {proposed.currency} -> {converted.cite()}"
+            amount = converted.amount
+            fact_currency = converted.to_currency
         value = amount
     else:  # "cancelled"
         text = proposed.value.strip().lower()
@@ -288,10 +586,24 @@ def resolve_fact(
         if value_date is None:
             return _reject(proposed, f"{proposed.value_date!r} is not a YYYY-MM-DD date")
 
+    if proposed.field in ("cancelled", "amended_amount") and not ALLOW_EVENT_MUTATIONS:
+        # Every check above already passed (citation, scope, relevance,
+        # affirmative supporting sentence, amount/currency binding for an
+        # amendment) -- this is a deliberate policy gate on top, not a
+        # substitute for them. It is the last line before acceptance so
+        # that "field in VALID_FACT_FIELDS and reaches this point" alone
+        # can never smuggle a mutation through some other code path.
+        return _reject(
+            proposed,
+            f"{proposed.field} mutations are disabled pending a validator that binds the "
+            "claimed effect to its correct referent (amount role, cancellation target); "
+            "see docs/reviews/PHASE_A_FOURTH_PASS_REVIEW.md",
+        )
+
     return ExtractedFact(
         proposed.field, proposed.target_event_id, proposed.target_scope, value,
-        proposed.currency, value_date, proposed.source_ids, "accepted", None,
-        proposed.source_span,
+        fact_currency, value_date, proposed.source_ids, "accepted", None,
+        proposed.source_span, conversion_note,
     )
 
 
@@ -455,6 +767,8 @@ class RowTrace:
                 "source_ids": list(f.source_ids),
                 "status": f.status,
                 "reason": f.reason,
+                "source_span": f.source_span,
+                "conversion_note": f.conversion_note,
             }
 
         return {

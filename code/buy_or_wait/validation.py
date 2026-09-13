@@ -19,7 +19,7 @@ Two kinds of check, deliberately distinct:
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import timedelta
+from datetime import date, timedelta
 from decimal import Decimal
 from typing import Optional, Sequence
 
@@ -27,6 +27,7 @@ from . import spending
 from .forecast import Forecast
 from .money import ZERO
 from .planner import Decision
+from .recurrence import Recurrence
 from .schema import (
     AFFORDABILITY_STATUSES,
     PAYMENT_METHODS,
@@ -48,6 +49,55 @@ class GateFailure:
         return f"{self.rule}: {self.detail}"
 
 
+def independent_replay(
+    forecast: Forecast,
+    extra: Sequence[tuple[date, Decimal]],
+) -> Optional[date]:
+    """Re-walk the timeline without calling `Forecast.walk` / `Forecast.is_safe`.
+
+    This is the release gate's own arithmetic, deliberately not sharing code
+    with the planner's safety check: if `Forecast.walk`, `Forecast.is_safe`, or
+    the planner's candidate ranking ever mis-certifies a plan, this replay must
+    still catch it rather than silently agreeing. It reconstructs signs from
+    `movement.direction` (never `movement.signed`), re-derives the debit ->
+    credit -> voluntary-payment ordering from scratch, and separately enforces
+    that every proposed payment date sits within `[request_date, horizon]`.
+
+    Returns the first date the balance falls below `minimum_balance`, or
+    `None` if the whole window is safe.
+    """
+    for on_date, _amount in extra:
+        if on_date < forecast.request_date or on_date > forecast.horizon:
+            return on_date
+
+    if not forecast.certifiable:
+        # An unquantified obligation makes the computed balance an upper
+        # bound, not a proof -- a replay against it cannot certify safety.
+        return forecast.request_date
+
+    rows: list[tuple[date, int, str, Decimal]] = []
+    for movement in forecast.movements:
+        if movement.direction == "debit":
+            rank, amount = 0, -movement.amount_home
+        elif movement.direction == "credit":
+            rank, amount = 1, movement.amount_home
+        else:  # pragma: no cover - forecast.movements never carries non_cash
+            continue
+        rows.append((movement.on_date, rank, movement.event_id, amount))
+    for index, (on_date, amount) in enumerate(extra):
+        rows.append((on_date, 2, f"__replay_{index:04d}", -amount))
+    rows.sort(key=lambda row: (row[0], row[1], row[2]))
+
+    balance = forecast.opening_balance
+    if balance < forecast.minimum_balance:
+        return forecast.request_date
+    for on_date, _rank, _event_id, amount in rows:
+        balance += amount
+        if balance < forecast.minimum_balance:
+            return on_date
+    return None
+
+
 def check(
     decision: Decision,
     request: RequestInput,
@@ -55,6 +105,7 @@ def check(
     forecast: Forecast,
     payment_options: Sequence[PaymentOption] = (),
     events: Sequence[FinancialEvent] = (),
+    recurrence: Optional[Recurrence] = None,
 ) -> list[GateFailure]:
     """Return every violated rule. Empty means the row may be published."""
     failures: list[GateFailure] = []
@@ -138,6 +189,22 @@ def check(
             fail("E1", "spending changes require affordable_with_plan")
         if len(decision.spending_changes) > 3:
             fail("E2", "at most three spending-change actions are allowed")
+        # Citation ids are only ever `FixedSeries.event_ids[-1]` for a *debit*
+        # series (`spending.eligible_actions`) -- never any event row that
+        # merely shares a category/description with one. Looking up an
+        # arbitrary matching event here would let a same-description,
+        # unrelated event row authorize a cut it was never eligible for.
+        citation_series: dict[str, object] = {}
+        if recurrence is not None:
+            for series in recurrence.fixed:
+                if series.direction == "debit" and series.event_ids:
+                    citation_series[series.event_ids[-1]] = series
+        # E5a-E5d: independent cited-event checks. The loader currently
+        # supplies same-user, same-direction contexts, so these are
+        # defense-in-depth guards, not evidence of a corrupted dataset.
+        # E5e (future projected occurrence in the certified window) is
+        # deferred: it couples the gate to forecast boundaries and could
+        # reject a currently-valid spending change, altering output.
         events_by_id = {e.event_id: e for e in events}
         seen: set[str] = set()
         for item in decision.spending_changes:
@@ -149,26 +216,57 @@ def check(
             if event_id in seen:
                 fail("E4", f"event {event_id} is referenced by more than one spending change")
             seen.add(event_id)
-            event = events_by_id.get(event_id)
-            if event is None:
-                fail("E5", f"spending change references unknown event_id {event_id!r}")
+            if action == "reduce" and (
+                new_amount is None or not new_amount.is_finite() or new_amount < ZERO
+            ):
+                fail("E7", f"{event_id}: reduce_to amount {new_amount} must be finite and non-negative")
                 continue
-            if event.category in profile.expense_categories_to_protect:
-                fail("E6", f"{event_id}: category {event.category} is protected")
+            # --- E5a: cited event must exist in the supplied events --------
+            cited_event = events_by_id.get(event_id)
+            if cited_event is None:
+                fail("E5", f"spending change cites {event_id!r}, which does not exist "
+                           f"in the supplied events")
+                continue
+            # --- E5b: cited event must belong to the request's user -------
+            if (cited_event.user_id != request.user_id
+                    or cited_event.user_id != profile.user_id):
+                fail("E5", f"{event_id}: event belongs to {cited_event.user_id!r}, "
+                           f"not the request/profile user "
+                           f"({request.user_id!r}/{profile.user_id!r})")
+                continue
+            # --- E5c: cited event must be a debit -------------------------
+            if cited_event.direction != "debit":
+                fail("E5", f"{event_id}: event direction is {cited_event.direction!r}, "
+                           f"not 'debit'")
+                continue
+            # --- E5: series membership (original check) -------------------
+            series = citation_series.get(event_id)
+            if series is None:
+                fail("E5", f"spending change references {event_id!r}, which is not the citation "
+                           f"id of an eligible recurring debit series")
+                continue
+            # --- E5d: series/event identity consistency -------------------
+            if (cited_event.category, cited_event.description) != (series.category, series.description):
+                fail("E5", f"{event_id}: event (category={cited_event.category!r}, "
+                           f"description={cited_event.description!r}) does not match series "
+                           f"(category={series.category!r}, description={series.description!r})")
+                continue
+            if series.category in profile.expense_categories_to_protect:
+                fail("E6", f"{event_id}: category {series.category} is protected")
             if action == "stop":
-                if event.flexibility not in STOPPABLE_FLEXIBILITIES:
-                    fail("E7", f"{event_id}: flexibility {event.flexibility} does not allow stopping")
-                if event.category not in profile.expense_categories_user_is_willing_to_stop:
-                    fail("E7", f"{event_id}: category {event.category} is not in willing-to-stop")
+                if series.flexibility not in STOPPABLE_FLEXIBILITIES:
+                    fail("E7", f"{event_id}: flexibility {series.flexibility} does not allow stopping")
+                if series.category not in profile.expense_categories_user_is_willing_to_stop:
+                    fail("E7", f"{event_id}: category {series.category} is not in willing-to-stop")
             else:
-                if event.flexibility not in REDUCIBLE_FLEXIBILITIES:
-                    fail("E7", f"{event_id}: flexibility {event.flexibility} does not allow reducing")
-                if event.category not in profile.expense_categories_user_is_willing_to_reduce:
-                    fail("E7", f"{event_id}: category {event.category} is not in willing-to-reduce")
-                if event.minimum_allowed_amount is not None and new_amount < event.minimum_allowed_amount:
+                if series.flexibility not in REDUCIBLE_FLEXIBILITIES:
+                    fail("E7", f"{event_id}: flexibility {series.flexibility} does not allow reducing")
+                if series.category not in profile.expense_categories_user_is_willing_to_reduce:
+                    fail("E7", f"{event_id}: category {series.category} is not in willing-to-reduce")
+                if series.minimum_allowed_amount is not None and new_amount < series.minimum_allowed_amount:
                     fail("E7", f"{event_id}: reduce_to {new_amount} is below "
-                               f"minimum_allowed_amount {event.minimum_allowed_amount}")
-                if event.amount is not None and new_amount >= event.amount:
+                               f"minimum_allowed_amount {series.minimum_allowed_amount}")
+                if new_amount >= series.amount_home:
                     fail("E7", f"{event_id}: reduce_to {new_amount} is not a reduction")
 
     # --- C11: the method must be one the user accepts -----------------------
@@ -236,8 +334,9 @@ def check(
             if decision.spending_changes else forecast
         )
         extra = [(p.on_date, p.amount) for p in decision.payments]
-        if not replay_forecast.is_safe(extra):
-            fail("P1", f"replay breaches the minimum balance on {replay_forecast.breach_date(extra)}")
+        breach = independent_replay(replay_forecast, extra)
+        if breach is not None:
+            fail("P1", f"independent replay breaches the minimum balance on {breach}")
 
     # --- P2: a degraded row must not recommend spending money --------------
     if decision.degraded and decision.payments:

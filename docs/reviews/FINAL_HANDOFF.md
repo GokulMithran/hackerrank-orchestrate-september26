@@ -2,7 +2,7 @@
 
 ## Artifacts
 
-- `code.zip`: 48 files, 193371 bytes; extracted package passes its audit and all 254 tests.
+- `code.zip`: 49 files; extracted package passes its audit and all 295 tests.
 - `output.csv`: original 250-row assisted output retained, with exact trace-based reproduction.
 - `code/evaluation/usage_report.md`: populated from the original recorded inference run.
 - `code/evaluation/final/`: source trace, usage, manifest, finalization notes, reporting comparison.

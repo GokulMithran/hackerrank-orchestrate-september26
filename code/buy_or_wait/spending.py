@@ -173,6 +173,11 @@ def apply_literals(
         if parsed is None:
             continue
         action, event_id, new_amount = parsed
+        if new_amount is not None and (not new_amount.is_finite() or new_amount < 0):
+            # A non-finite or negative reduce_to amount is invalid regardless
+            # of validation.check's E7 -- do not let it corrupt the replay
+            # forecast (e.g. a NaN movement amount).
+            continue
         event = events_by_id.get(event_id)
         if event is None:
             continue

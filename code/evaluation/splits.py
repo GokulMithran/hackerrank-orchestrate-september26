@@ -11,6 +11,17 @@ ids by `sha256(SALT:request_id)` and take the first `DEV_SIZE` for development.
 No seeded RNG is involved, so the split is reproducible on any machine and any
 Python version.
 
+**Portability (`SPLIT_VERSION` 2).** The gating identity of
+`sample_requests.csv` is `sample_sha256`, a *canonical* content hash
+(`buy_or_wait.data.canonical_content_sha256`) that normalizes CRLF/CR to LF
+before hashing, so a manifest frozen on one OS still verifies after a clone
+that checks the file out with different line endings elsewhere -- Linux CI or
+a browser-based evaluator, in particular. The raw byte hash is retained
+separately as `sample_sha256_raw` for provenance only; it is never compared
+during verification, because it is expected to differ across checkouts. An
+actual content change (any byte difference that survives newline
+normalization) still changes `sample_sha256` and is still rejected.
+
 **Exposure disclosure.** These 25 rows are public examples, not hidden ground
 truth, and prior sessions on this project have already read all 25 while
 establishing output conventions. Numbers computed on the reporting subset must
@@ -25,7 +36,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Sequence
 
-SPLIT_VERSION = 1
+SPLIT_VERSION = 2
 SPLIT_SALT = "buy-or-wait-2026-09"
 SPLIT_ALGORITHM = "sha256(salt:request_id) ascending"
 DEV_SIZE = 10
@@ -44,7 +55,8 @@ class Split:
     version: int
     salt: str
     algorithm: str
-    sample_sha256: str
+    sample_sha256: str          # canonical content identity -- the gate
+    sample_sha256_raw: str = "" # raw-byte identity -- provenance only
 
     def assert_disjoint(self) -> None:
         overlap = set(self.dev) & set(self.report)
@@ -63,8 +75,14 @@ def _rank(request_id: str) -> str:
     return hashlib.sha256(f"{SPLIT_SALT}:{request_id}".encode("utf-8")).hexdigest()
 
 
-def compute_split(request_ids: Sequence[str], sample_sha256: str) -> Split:
-    """Derive the split from the sample request ids. Pure and deterministic."""
+def compute_split(request_ids: Sequence[str], sample_sha256: str,
+                  sample_sha256_raw: str = "") -> Split:
+    """Derive the split from the sample request ids. Pure and deterministic.
+
+    `sample_sha256` is the canonical (newline-normalized) content hash and is
+    the only one compared during verification. `sample_sha256_raw` is stored
+    only for provenance and is expected to differ across a CRLF/LF checkout.
+    """
     unique = sorted(set(request_ids))
     if len(unique) != len(request_ids):
         raise SplitError("duplicate request_id in sample requests")
@@ -78,6 +96,7 @@ def compute_split(request_ids: Sequence[str], sample_sha256: str) -> Split:
         salt=SPLIT_SALT,
         algorithm=SPLIT_ALGORITHM,
         sample_sha256=sample_sha256,
+        sample_sha256_raw=sample_sha256_raw,
     )
     split.assert_disjoint()
     return split
@@ -89,6 +108,7 @@ def _as_dict(split: Split) -> dict:
         "salt": split.salt,
         "algorithm": split.algorithm,
         "sample_requests_sha256": split.sample_sha256,
+        "sample_requests_sha256_raw": split.sample_sha256_raw,
         "dev": list(split.dev),
         "report": list(split.report),
     }
@@ -108,6 +128,14 @@ def write_manifest(split: Split, path: Path = MANIFEST_PATH) -> None:
 
 def load_manifest(path: Path = MANIFEST_PATH) -> Split:
     payload = json.loads(path.read_text(encoding="utf-8"))
+    if "sample_requests_sha256" not in payload:
+        raise SplitError(f"{path}: manifest is missing sample_requests_sha256")
+    if payload.get("version") == 1:
+        raise SplitError(
+            f"{path}: manifest is SPLIT_VERSION 1 (raw-byte identity only). "
+            "Migrate deliberately with the version-2 canonical hash "
+            "(buy_or_wait.data.canonical_content_sha256) rather than deleting it."
+        )
     split = Split(
         dev=tuple(payload["dev"]),
         report=tuple(payload["report"]),
@@ -115,21 +143,25 @@ def load_manifest(path: Path = MANIFEST_PATH) -> Split:
         salt=payload["salt"],
         algorithm=payload["algorithm"],
         sample_sha256=payload["sample_requests_sha256"],
+        sample_sha256_raw=payload.get("sample_requests_sha256_raw", ""),
     )
     split.assert_disjoint()
     return split
 
 
 def ensure_split(request_ids: Sequence[str], sample_sha256: str,
-                 path: Path = MANIFEST_PATH, *, allow_create: bool = True) -> Split:
+                 path: Path = MANIFEST_PATH, *, allow_create: bool = True,
+                 sample_sha256_raw: str = "") -> Split:
     """Return the frozen split, creating it exactly once.
 
     If the manifest exists it is verified against a freshly computed split and
-    against the sample file hash. Disagreement raises rather than rewriting --
-    silently regenerating a split after tuning is the failure mode this whole
-    module exists to prevent.
+    against the sample file's *canonical* hash. Disagreement raises rather
+    than rewriting -- silently regenerating a split after tuning is the
+    failure mode this whole module exists to prevent. `sample_sha256_raw` is
+    never part of that comparison: it is expected to differ across a
+    CRLF/LF checkout and is recorded for provenance only.
     """
-    computed = compute_split(request_ids, sample_sha256)
+    computed = compute_split(request_ids, sample_sha256, sample_sha256_raw)
     if not path.exists():
         if not allow_create:
             raise SplitError(f"split manifest missing at {path}")
@@ -143,7 +175,8 @@ def ensure_split(request_ids: Sequence[str], sample_sha256: str,
     if stored.salt != computed.salt:
         problems.append(f"salt {stored.salt!r} != {computed.salt!r}")
     if stored.sample_sha256 != computed.sample_sha256:
-        problems.append("sample_requests.csv has changed since the split was frozen")
+        problems.append("sample_requests.csv has changed since the split was frozen "
+                         "(canonical content hash differs)")
     if stored.dev != computed.dev or stored.report != computed.report:
         problems.append("stored id lists differ from the recomputed split")
     if problems:

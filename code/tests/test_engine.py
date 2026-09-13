@@ -576,6 +576,23 @@ class GateTests(unittest.TestCase):
                                        "payments": (planner.Payment(TODAY, D("1000")),)})
         self.assertIn("P1", self.check(decision, forecast=forecast))
 
+    def test_p1_independent_replay_survives_a_faulty_planner_safety_method(self):
+        # A stubbed `Forecast.is_safe`/`walk` that always claims safety must
+        # not be able to bypass P1: `validation.independent_replay` re-derives
+        # the walk from `forecast.movements` on its own, never calling either.
+        forecast = build([event("rent", amount="9500", status="scheduled",
+                                on=TODAY + timedelta(days=10))])[2]
+        decision = planner.Decision(**{**self.good().__dict__,
+                                       "payments": (planner.Payment(TODAY, D("1000")),)})
+        original_is_safe, original_walk = F.Forecast.is_safe, F.Forecast.walk
+        F.Forecast.is_safe = lambda self, extra=(): True
+        F.Forecast.walk = lambda self, extra=(): [F.Step(self.request_date, self.opening_balance, None)]
+        try:
+            self.assertIn("P1", self.check(decision, forecast=forecast))
+        finally:
+            F.Forecast.is_safe = original_is_safe
+            F.Forecast.walk = original_walk
+
     def test_p2_degraded_row_cannot_recommend_a_payment(self):
         decision = planner.Decision(**{**self.good().__dict__, "degraded": True})
         failures = self.check(decision)
@@ -588,13 +605,45 @@ class GateTests(unittest.TestCase):
         self.assertEqual(fallback.recommended_payment_method, "not_recommended")
 
 
+class IndependentReplayTests(unittest.TestCase):
+    """Unit tests for `validation.independent_replay`, which deliberately does
+    not call `Forecast.walk` / `Forecast.is_safe`."""
+
+    def test_safe_schedule_returns_none(self):
+        forecast = build([])[2]
+        self.assertIsNone(validation.independent_replay(forecast, [(TODAY, D("500"))]))
+
+    def test_breach_returns_the_first_offending_date(self):
+        forecast = build([event("rent", amount="9500", status="scheduled",
+                                on=TODAY + timedelta(days=10))])[2]
+        breach = validation.independent_replay(forecast, [(TODAY, D("1000"))])
+        self.assertEqual(breach, TODAY + timedelta(days=10))
+
+    def test_payment_before_request_date_is_rejected(self):
+        forecast = build([])[2]
+        early = TODAY - timedelta(days=1)
+        self.assertEqual(validation.independent_replay(forecast, [(early, D("10"))]), early)
+
+    def test_payment_after_horizon_is_rejected(self):
+        forecast = build([])[2]
+        late = forecast.horizon + timedelta(days=1)
+        self.assertEqual(validation.independent_replay(forecast, [(late, D("10"))]), late)
+
+    def test_uncertain_forecast_cannot_be_certified_safe(self):
+        events = [event("unk", amount=None, direction="debit", status="settled",
+                        on=TODAY + timedelta(days=5))]
+        forecast = build(events)[2]
+        self.assertFalse(forecast.certifiable)
+        self.assertEqual(validation.independent_replay(forecast, [(TODAY, D("10"))]), TODAY)
+
+
 class M3GateTests(unittest.TestCase):
     """Negative tests for C5-C10 (partial_payment, installments) and E1-E7
     (spending_changes_needed), plus P1 replay of a spending-change claim."""
 
-    def check(self, decision, req, prof, forecast, payment_options=(), events=()):
+    def check(self, decision, req, prof, forecast, payment_options=(), events=(), rec=None):
         return [f.rule for f in validation.check(decision, req, prof, forecast,
-                                                  payment_options, events)]
+                                                  payment_options, events, rec)]
 
     # ---- partial_payment (C5-C8) -------------------------------------------
 
@@ -685,85 +734,110 @@ class M3GateTests(unittest.TestCase):
         _, rec, forecast = build(events, prof)
         req = request("900", deadline_days=60)
         decision = planner.choose(req, prof, forecast, rec)
-        return req, prof, forecast, tuple(events), decision
+        return req, prof, forecast, tuple(events), decision, rec
 
     def test_good_spending_change_passes(self):
-        req, prof, forecast, events, decision = self._spending_setup()
-        self.assertEqual(self.check(decision, req, prof, forecast, (), events), [])
+        req, prof, forecast, events, decision, rec = self._spending_setup()
+        self.assertEqual(self.check(decision, req, prof, forecast, (), events, rec), [])
 
     def test_e1_spending_changes_require_affordable_with_plan(self):
-        req, prof, forecast, events, decision = self._spending_setup()
+        req, prof, forecast, events, decision, rec = self._spending_setup()
         bad = planner.Decision(**{**decision.__dict__, "affordability_status": "affordable_now"})
-        self.assertIn("E1", self.check(bad, req, prof, forecast, (), events))
+        self.assertIn("E1", self.check(bad, req, prof, forecast, (), events, rec))
 
     def test_e2_too_many_spending_changes(self):
-        req, prof, forecast, events, decision = self._spending_setup()
+        req, prof, forecast, events, decision, rec = self._spending_setup()
         literal = decision.spending_changes[0]
         bad = planner.Decision(**{**decision.__dict__, "spending_changes": (literal,) * 4})
-        self.assertIn("E2", self.check(bad, req, prof, forecast, (), events))
+        self.assertIn("E2", self.check(bad, req, prof, forecast, (), events, rec))
 
     def test_e3_unparseable_spending_change(self):
-        req, prof, forecast, events, decision = self._spending_setup()
+        req, prof, forecast, events, decision, rec = self._spending_setup()
         bad = planner.Decision(**{**decision.__dict__, "spending_changes": ("garbage",)})
-        self.assertIn("E3", self.check(bad, req, prof, forecast, (), events))
+        self.assertIn("E3", self.check(bad, req, prof, forecast, (), events, rec))
 
     def test_e4_duplicate_event_reference(self):
-        req, prof, forecast, events, decision = self._spending_setup()
+        req, prof, forecast, events, decision, rec = self._spending_setup()
         event_id = decision.spending_changes[0].split(":")[1]
         bad = planner.Decision(**{**decision.__dict__,
                                    "spending_changes": (f"stop:{event_id}",
                                                         f"reduce_to:{event_id}:100")})
-        self.assertIn("E4", self.check(bad, req, prof, forecast, (), events))
+        self.assertIn("E4", self.check(bad, req, prof, forecast, (), events, rec))
 
     def test_e5_unknown_event_id(self):
-        req, prof, forecast, events, decision = self._spending_setup()
+        req, prof, forecast, events, decision, rec = self._spending_setup()
         bad = planner.Decision(**{**decision.__dict__, "spending_changes": ("stop:no_such_event",)})
-        self.assertIn("E5", self.check(bad, req, prof, forecast, (), events))
+        self.assertIn("E5", self.check(bad, req, prof, forecast, (), events, rec))
+
+    def test_e5_same_description_unrelated_event_cannot_authorize_a_cut(self):
+        # A same-(category, description) event that is NOT the recurring
+        # series' own citation id (`event_ids[-1]`) must not authorize a
+        # spending change.
+        req, prof, forecast, events, decision, rec = self._spending_setup()
+        impostor = event("impostor_netflix", amount="500", category="streaming",
+                         description="netflix", flexibility="stoppable",
+                         on=TODAY - timedelta(days=1))
+        bad = planner.Decision(**{**decision.__dict__,
+                                   "spending_changes": ("stop:impostor_netflix",)})
+        self.assertIn("E5", self.check(bad, req, prof, forecast, (), events + (impostor,), rec))
 
     def test_e6_protected_category(self):
-        req, prof, forecast, events, decision = self._spending_setup()
+        req, prof, forecast, events, decision, _ = self._spending_setup()
         rent_events = tuple(monthly_series("rent", n=4, amount="500", category="rent",
                                            description="rent", flexibility="stoppable"))
+        _, rec2, _ = build(events + rent_events, prof)
         bad = planner.Decision(**{**decision.__dict__, "spending_changes": ("stop:rent0",)})
-        self.assertIn("E6", self.check(bad, req, prof, forecast, (), events + rent_events))
+        self.assertIn("E6", self.check(bad, req, prof, forecast, (), events + rent_events, rec2))
 
     def test_e7_wrong_flexibility_for_stop(self):
-        req, prof, forecast, events, decision = self._spending_setup()
+        req, prof, forecast, events, decision, _ = self._spending_setup()
         # "streaming" is in willing_to_stop, but this event is "fixed", not stoppable.
         fixed_events = tuple(monthly_series("fx", n=4, amount="200", category="streaming",
                                             description="fixed sub", flexibility="fixed"))
+        _, rec2, _ = build(events + fixed_events, prof)
         bad = planner.Decision(**{**decision.__dict__, "spending_changes": ("stop:fx0",)})
-        self.assertIn("E7", self.check(bad, req, prof, forecast, (), events + fixed_events))
+        self.assertIn("E7", self.check(bad, req, prof, forecast, (), events + fixed_events, rec2))
 
     def test_e7_category_not_permitted_for_reduce(self):
-        req, prof, forecast, events, decision = self._spending_setup()
+        req, prof, forecast, events, decision, _ = self._spending_setup()
         # "gym" is reducible but not in profile()'s willing_to_reduce (only "dining" is).
         gym_events = tuple(monthly_series("gx", n=4, amount="300", category="gym",
                                           description="membership", flexibility="reducible",
                                           floor="100"))
+        _, rec2, _ = build(events + gym_events, prof)
         bad = planner.Decision(**{**decision.__dict__, "spending_changes": ("reduce_to:gx0:100",)})
-        self.assertIn("E7", self.check(bad, req, prof, forecast, (), events + gym_events))
+        self.assertIn("E7", self.check(bad, req, prof, forecast, (), events + gym_events, rec2))
 
     def test_e7_reduce_below_floor(self):
-        req, prof, forecast, events, decision = self._spending_setup()
+        req, prof, forecast, events, decision, _ = self._spending_setup()
         dining_events = tuple(monthly_series("din", n=4, amount="300", category="dining",
                                              description="eating out", flexibility="reducible",
                                              floor="100"))
+        _, rec2, _ = build(events + dining_events, prof)
         bad = planner.Decision(**{**decision.__dict__, "spending_changes": ("reduce_to:din0:50",)})
-        self.assertIn("E7", self.check(bad, req, prof, forecast, (), events + dining_events))
+        self.assertIn("E7", self.check(bad, req, prof, forecast, (), events + dining_events, rec2))
 
     def test_e7_reduce_is_not_actually_a_reduction(self):
-        req, prof, forecast, events, decision = self._spending_setup()
+        req, prof, forecast, events, decision, _ = self._spending_setup()
         dining_events = tuple(monthly_series("din", n=4, amount="300", category="dining",
                                              description="eating out", flexibility="reducible",
                                              floor="100"))
+        _, rec2, _ = build(events + dining_events, prof)
         bad = planner.Decision(**{**decision.__dict__, "spending_changes": ("reduce_to:din0:300",)})
-        self.assertIn("E7", self.check(bad, req, prof, forecast, (), events + dining_events))
+        self.assertIn("E7", self.check(bad, req, prof, forecast, (), events + dining_events, rec2))
+
+    def test_e7_reduce_amount_must_be_finite_and_non_negative(self):
+        req, prof, forecast, events, decision, rec = self._spending_setup()
+        for bad_amount in ("-100", "NaN", "Infinity"):
+            with self.subTest(bad_amount=bad_amount):
+                bad = planner.Decision(**{**decision.__dict__,
+                                           "spending_changes": (f"reduce_to:net0:{bad_amount}",)})
+                self.assertIn("E7", self.check(bad, req, prof, forecast, (), events, rec))
 
     # ---- P1 replay of a spending-change claim ------------------------------
 
     def test_p1_replay_catches_a_spending_change_that_frees_nothing(self):
-        req, prof, forecast, events, decision = self._spending_setup()
+        req, prof, forecast, events, decision, _ = self._spending_setup()
         # A real, stoppable, willing-to-stop event -- but a stale settled one that
         # is not the series' cited event and matches no projected movement, so
         # stopping it frees no headroom and the payment still breaches.
@@ -773,6 +847,59 @@ class M3GateTests(unittest.TestCase):
         bad = planner.Decision(**{**decision.__dict__,
                                    "spending_changes": (f"stop:{unrelated.event_id}",)})
         self.assertIn("P1", self.check(bad, req, prof, forecast, (), events + (unrelated,)))
+
+    # ---- E5a-E5d: cited-event ownership / existence / direction checks ------
+    # R-B1-01 regression tests. The loader currently prevents these upstream;
+    # these are independent safeguards.
+
+    def test_e5_foreign_user_event_rejected(self):
+        """A spending change citing an event that belongs to another user must fail."""
+        from dataclasses import replace as dc_replace
+        req, prof, forecast, events, decision, rec = self._spending_setup()
+        foreign = tuple(dc_replace(item, user_id="another_user") for item in events)
+        self.assertIn("E5", self.check(decision, req, prof, forecast, (), foreign, rec))
+
+    def test_e5_mismatched_profile_user_rejected(self):
+        """Events match request.user_id but profile has a different user -- E5b must catch it."""
+        from dataclasses import replace as dc_replace
+        req, prof, forecast, events, decision, rec = self._spending_setup()
+        bad_prof = dc_replace(prof, user_id="mismatched_user")
+        self.assertIn("E5", self.check(decision, req, bad_prof, forecast, (), events, rec))
+
+    def test_e5_missing_event_in_registry_rejected(self):
+        """A spending change citing an event_id absent from the supplied events must fail."""
+        req, prof, forecast, _events, decision, rec = self._spending_setup()
+        # Pass empty events tuple: the cited event_id won't be found.
+        self.assertIn("E5", self.check(decision, req, prof, forecast, (), (), rec))
+
+    def test_e5_credit_event_rejected(self):
+        """A spending change citing a credit event must fail."""
+        from dataclasses import replace as dc_replace
+        req, prof, forecast, events, decision, rec = self._spending_setup()
+        # Find the cited event_id from the decision's spending change
+        parsed = spending.from_literal(decision.spending_changes[0])
+        self.assertIsNotNone(parsed)
+        _, cited_id, _ = parsed
+        # Replace that event's direction with credit
+        patched = tuple(
+            dc_replace(e, direction="credit") if e.event_id == cited_id else e
+            for e in events
+        )
+        self.assertIn("E5", self.check(decision, req, prof, forecast, (), patched, rec))
+
+    def test_e5_category_mismatch_between_event_and_series_rejected(self):
+        """A spending change where the cited event's category differs from the series must fail."""
+        from dataclasses import replace as dc_replace
+        req, prof, forecast, events, decision, rec = self._spending_setup()
+        parsed = spending.from_literal(decision.spending_changes[0])
+        self.assertIsNotNone(parsed)
+        _, cited_id, _ = parsed
+        # Replace that event's category with something different from the series
+        patched = tuple(
+            dc_replace(e, category="dining") if e.event_id == cited_id else e
+            for e in events
+        )
+        self.assertIn("E5", self.check(decision, req, prof, forecast, (), patched, rec))
 
 
 if __name__ == "__main__":

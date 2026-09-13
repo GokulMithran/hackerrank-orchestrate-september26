@@ -10,7 +10,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from buy_or_wait.data import file_sha256, load_dataset  # noqa: E402
+from buy_or_wait.data import canonical_content_sha256, file_sha256, load_dataset  # noqa: E402
 from evaluation.splits import (  # noqa: E402
     DEV_SIZE,
     SplitError,
@@ -124,7 +124,7 @@ class ManifestTests(unittest.TestCase):
 class RealSplitTests(unittest.TestCase):
     def test_split_of_the_real_samples_is_disjoint_by_request_and_user(self):
         data = load_dataset(REAL_DATASET)
-        sha = file_sha256(REAL_DATASET / "sample_requests.csv")
+        sha = canonical_content_sha256(REAL_DATASET / "sample_requests.csv")
         tmp = tempfile.TemporaryDirectory()
         self.addCleanup(tmp.cleanup)
         split = ensure_split([r.request_id for r in data.sample_requests], sha,
@@ -140,13 +140,83 @@ class RealSplitTests(unittest.TestCase):
 
     def test_no_evaluation_request_can_enter_the_split(self):
         data = load_dataset(REAL_DATASET)
-        sha = file_sha256(REAL_DATASET / "sample_requests.csv")
+        sha = canonical_content_sha256(REAL_DATASET / "sample_requests.csv")
         tmp = tempfile.TemporaryDirectory()
         self.addCleanup(tmp.cleanup)
         split = ensure_split([r.request_id for r in data.sample_requests], sha,
                              Path(tmp.name) / "m.json")
         evaluation_ids = {r.request_id for r in data.requests}
         self.assertEqual(set(split.dev + split.report) & evaluation_ids, set())
+
+    def test_frozen_manifest_verifies_against_the_real_sample_file(self):
+        """The shipped, migrated `split_manifest.json` must still verify
+        against the real `sample_requests.csv` on this machine."""
+        data = load_dataset(REAL_DATASET)
+        split = ensure_split(
+            [r.request_id for r in data.sample_requests],
+            canonical_content_sha256(REAL_DATASET / "sample_requests.csv"),
+            sample_sha256_raw=file_sha256(REAL_DATASET / "sample_requests.csv"),
+            allow_create=False,
+        )
+        self.assertEqual(split.version, 2)
+
+
+class PortabilityTests(unittest.TestCase):
+    """SPLIT_VERSION 2: the gate is the canonical (newline-normalized)
+    content hash, not the raw byte hash, so a CRLF checkout of the same
+    content still verifies -- but an actual value change is still caught."""
+
+    def path(self) -> Path:
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        return Path(tmp.name)
+
+    def write_sample(self, tmp: Path, name: str, newline: bytes) -> Path:
+        path = tmp / name
+        lines = [b"request_id,amount", b"request_01,100", b"request_02,200"]
+        path.write_bytes(newline.join(lines) + newline)
+        return path
+
+    def test_lf_and_crlf_checkouts_of_identical_content_verify_as_the_same_split(self):
+        tmp = self.path()
+        lf_path = self.write_sample(tmp, "lf.csv", b"\n")
+        crlf_path = self.write_sample(tmp, "crlf.csv", b"\r\n")
+        self.assertNotEqual(file_sha256(lf_path), file_sha256(crlf_path))
+        self.assertEqual(canonical_content_sha256(lf_path), canonical_content_sha256(crlf_path))
+
+        manifest_path = tmp / "m.json"
+        first = ensure_split(IDS, canonical_content_sha256(lf_path), manifest_path,
+                             sample_sha256_raw=file_sha256(lf_path))
+        second = ensure_split(IDS, canonical_content_sha256(crlf_path), manifest_path,
+                              sample_sha256_raw=file_sha256(crlf_path))
+        self.assertEqual(first.dev, second.dev)
+        self.assertEqual(first.report, second.report)
+
+    def test_an_actual_content_change_is_still_rejected(self):
+        tmp = self.path()
+        path = tmp / "sample_requests.csv"
+        path.write_bytes(b"request_id,amount\nrequest_01,100\n")
+        manifest_path = tmp / "m.json"
+        ensure_split(IDS, canonical_content_sha256(path), manifest_path)
+
+        path.write_bytes(b"request_id,amount\nrequest_01,999\n")
+        with self.assertRaises(SplitError) as ctx:
+            ensure_split(IDS, canonical_content_sha256(path), manifest_path)
+        self.assertIn("canonical content hash differs", str(ctx.exception))
+
+    def test_version_1_manifest_is_rejected_with_a_migration_message(self):
+        tmp = self.path()
+        legacy = {
+            "version": 1, "salt": "buy-or-wait-2026-09",
+            "algorithm": "sha256(salt:request_id) ascending",
+            "sample_requests_sha256": "0" * 64,
+            "dev": list(IDS[:DEV_SIZE]), "report": list(IDS[DEV_SIZE:]),
+        }
+        path = tmp / "m.json"
+        path.write_text(json.dumps(legacy), encoding="utf-8")
+        with self.assertRaises(SplitError) as ctx:
+            load_manifest(path)
+        self.assertIn("SPLIT_VERSION 1", str(ctx.exception))
 
 
 if __name__ == "__main__":

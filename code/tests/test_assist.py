@@ -17,7 +17,7 @@ import dataclasses
 from buy_or_wait import assist  # noqa: E402
 from buy_or_wait import model as model_module  # noqa: E402
 from buy_or_wait.data import load_dataset  # noqa: E402
-from buy_or_wait.evidence import ProposedFact, apply_facts_to_events  # noqa: E402
+from buy_or_wait.evidence import ProposedFact, apply_facts_to_events, citation_note  # noqa: E402
 from tests import fixtures  # noqa: E402
 
 import main as main_module  # noqa: E402
@@ -163,6 +163,75 @@ class SuccessfulExtractionTests(AssistTestCase):
         trace, facts = assist.extract_facts(context, self.data, config)
         self.assertEqual(facts, ())
         self.assertTrue(trace.provider_status.startswith("failed"))
+
+
+class MutationFieldsDisabledByDefaultTests(AssistTestCase):
+    """Phase A fourth-pass review (docs/reviews/PHASE_A_FOURTH_PASS_REVIEW.md):
+    `cancelled`/`amended_amount` acceptance is disabled by default because
+    effect-to-target binding is not yet verified. This is an end-to-end,
+    fake-provider proof that a *fully evidence-backed* mutation proposal --
+    real message text that would otherwise pass every other check -- still
+    cannot patch an event, alter the deterministic forecast, or be cited in
+    `decision_explanation`, all the way through `main.decide_one`."""
+
+    def build_context_with_evidenced_cancellation(self):
+        mutate = fixtures.edit(
+            "messages.csv", 0,
+            message_text="Your February salary payment has been cancelled. Ref EMP-0001.",
+        )
+        dataset_dir = fixtures.build_dataset(Path(tempfile.mkdtemp()), mutate=mutate)
+        data = load_dataset(dataset_dir)
+        return data, data.context_for("request_01")
+
+    def test_evidenced_cancellation_is_rejected_and_leaves_event_untouched(self):
+        data, context = self.build_context_with_evidenced_cancellation()
+        config, provider = SuccessfulExtractionTests.make_config(self, (
+            ProposedFact(field="cancelled", target_event_id="event_04", target_scope="event",
+                        value="true", source_ids=("message_01",),
+                        source_span="Your February salary payment has been cancelled."),
+        ))
+        trace, facts = assist.extract_facts(context, data, config)
+        self.assertEqual(facts, ())
+        self.assertEqual(len(trace.rejected), 1)
+        self.assertIn("mutations are disabled", trace.rejected[0].reason)
+
+        original_event = next(e for e in context.events if e.event_id == "event_04")
+        patched = apply_facts_to_events(context.events, facts)
+        patched_event = next(e for e in patched if e.event_id == "event_04")
+        self.assertEqual(patched_event.status, original_event.status)
+        self.assertEqual(patched_event.amount, original_event.amount)
+
+        decision, _ = main_module.decide_one(context, data.rates_by_key)
+        patched_decision, _ = main_module.decide_one(
+            dataclasses.replace(context, events=patched), data.rates_by_key)
+        self.assertEqual(decision.amount_safe_to_pay, patched_decision.amount_safe_to_pay)
+        # No accepted fact means no citation for this proposal can ever
+        # reach `decision_explanation` (main.py only appends `citation_note`
+        # for `trace.accepted`).
+        self.assertIsNone(citation_note(trace))
+
+    def test_evidenced_amendment_is_rejected_and_leaves_event_untouched(self):
+        mutate = fixtures.edit(
+            "messages.csv", 0,
+            message_text="Correction: your February salary was actually paid as ZAR 4365000.",
+        )
+        dataset_dir = fixtures.build_dataset(Path(tempfile.mkdtemp()), mutate=mutate)
+        data = load_dataset(dataset_dir)
+        context = data.context_for("request_01")
+        config, provider = SuccessfulExtractionTests.make_config(self, (
+            ProposedFact(field="amended_amount", target_event_id="event_04", target_scope="event",
+                        value="4365000", source_ids=("message_01",)),
+        ))
+        trace, facts = assist.extract_facts(context, data, config)
+        self.assertEqual(facts, ())
+        self.assertEqual(len(trace.rejected), 1)
+        self.assertIn("mutations are disabled", trace.rejected[0].reason)
+
+        original_event = next(e for e in context.events if e.event_id == "event_04")
+        patched = apply_facts_to_events(context.events, facts)
+        patched_event = next(e for e in patched if e.event_id == "event_04")
+        self.assertEqual(patched_event.amount, original_event.amount)
+        self.assertDatasetUntouched()
 
 
 def assist_replace_cache(config: assist.AssistConfig, cache) -> assist.AssistConfig:

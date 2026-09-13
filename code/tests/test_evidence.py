@@ -172,6 +172,332 @@ class CitationValidationTests(EvidenceTestCase):
         self.assertIsNone(result.value)
 
 
+class EvidenceAuthorizationTests(EvidenceTestCase):
+    """Closes the evidence-authorization holes from
+    `docs/reviews/ACCURACY_IMPROVEMENT_PLAN.md` Phase A / the regression
+    probes in `docs/reviews/accuracy_regression_probes.py`: a source's
+    existence and ownership are necessary, not sufficient proof of its
+    claim."""
+
+    def test_structured_event_cannot_self_authorize_cancellation(self):
+        context, _, candidates = self.candidates("request_01")
+        proposed = ProposedFact(
+            field="cancelled", target_event_id="event_01", target_scope="event",
+            value="true", source_ids=("event_01",),
+        )
+        result = resolve_fact(proposed, candidates=candidates, context=context,
+                              events_by_id=self.events_by_id)
+        self.assertEqual(result.status, "rejected")
+        self.assertIn("cannot cite itself", result.reason)
+
+    def test_structured_event_cannot_self_authorize_amendment(self):
+        context, _, candidates = self.candidates("request_01")
+        proposed = ProposedFact(
+            field="amended_amount", target_event_id="event_01", target_scope="event",
+            value="1", source_ids=("event_01",),
+        )
+        result = resolve_fact(proposed, candidates=candidates, context=context,
+                              events_by_id=self.events_by_id)
+        self.assertEqual(result.status, "rejected")
+        self.assertIn("cannot cite itself", result.reason)
+
+    def test_message_backed_cancellation_passes_evidence_checks_but_is_disabled(self):
+        # A real message that actually documents the cancellation (not
+        # merely linked to the event by id) clears every evidence check --
+        # the self-citation guard is not a blanket ban on genuinely
+        # supported cancellations/amendments -- but the field-level policy
+        # gate still blocks acceptance by default (Phase A fourth-pass
+        # review: effect-to-target binding is not yet verified).
+        mutate = fixtures.edit(
+            "messages.csv", 0,
+            message_text="Your February salary payment has been cancelled. Ref EMP-0001.",
+        )
+        dataset_dir = fixtures.build_dataset(Path(tempfile.mkdtemp()), mutate=mutate)
+        data = load_dataset(dataset_dir)
+        context = data.context_for("request_01")
+        events_by_id = data.events_by_id
+        candidates = available_candidates(retrieve_candidates(context, events_by_id))
+        proposed = ProposedFact(
+            field="cancelled", target_event_id="event_04", target_scope="event",
+            value="true", source_ids=("message_01",),
+            source_span="Your February salary payment has been cancelled.",
+        )
+        result = resolve_fact(proposed, candidates=candidates, context=context,
+                              events_by_id=events_by_id)
+        self.assertEqual(result.status, "rejected")
+        self.assertIn("mutations are disabled", result.reason)
+
+    def test_linked_message_silent_on_cancellation_does_not_authorize_it(self):
+        # message_01 is linked to event_04 via related_event_id, but its actual
+        # content ("Your February payslip is attached") says nothing about a
+        # cancellation. Relatedness alone must not authorize the claim.
+        context, _, candidates = self.candidates("request_01")
+        proposed = ProposedFact(
+            field="cancelled", target_event_id="event_04", target_scope="event",
+            value="true", source_ids=("message_01",),
+        )
+        result = resolve_fact(proposed, candidates=candidates, context=context,
+                              events_by_id=self.events_by_id)
+        self.assertEqual(result.status, "rejected")
+        self.assertIn("do not affirmatively state a cancelled", result.reason)
+
+    def test_linked_message_silent_on_amendment_does_not_authorize_it(self):
+        context, _, candidates = self.candidates("request_01")
+        proposed = ProposedFact(
+            field="amended_amount", target_event_id="event_04", target_scope="event",
+            value="5000000", source_ids=("message_01",),
+        )
+        result = resolve_fact(proposed, candidates=candidates, context=context,
+                              events_by_id=self.events_by_id)
+        self.assertEqual(result.status, "rejected")
+        self.assertIn("do not affirmatively state a amended amount", result.reason)
+
+    def test_source_span_alone_cannot_forge_supporting_language(self):
+        # The model's own `source_span` claiming cancellation language is not
+        # ground truth: the real cited message text must actually contain it.
+        context, _, candidates = self.candidates("request_01")
+        proposed = ProposedFact(
+            field="cancelled", target_event_id="event_04", target_scope="event",
+            value="true", source_ids=("message_01",),
+            source_span="This payment was cancelled.",
+        )
+        result = resolve_fact(proposed, candidates=candidates, context=context,
+                              events_by_id=self.events_by_id)
+        self.assertEqual(result.status, "rejected")
+
+    def test_negated_or_conditional_cancellation_is_not_authorized(self):
+        # A keyword match alone is not proof: negated, conditional, and
+        # still-pending language must not authorize removing a real debit.
+        for text in (
+            "This payment has not been cancelled. It remains due.",
+            "If you cancel next month, please notify payroll.",
+            "Your refund request is pending; the payment remains due.",
+        ):
+            with self.subTest(text=text):
+                mutate = fixtures.edit("messages.csv", 0, message_text=text)
+                dataset_dir = fixtures.build_dataset(Path(tempfile.mkdtemp()), mutate=mutate)
+                data = load_dataset(dataset_dir)
+                context = data.context_for("request_01")
+                events_by_id = data.events_by_id
+                candidates = available_candidates(retrieve_candidates(context, events_by_id))
+                proposed = ProposedFact(
+                    field="cancelled", target_event_id="event_04", target_scope="event",
+                    value="true", source_ids=("message_01",), source_span=text,
+                )
+                result = resolve_fact(proposed, candidates=candidates, context=context,
+                                      events_by_id=events_by_id)
+                self.assertEqual(result.status, "rejected")
+
+    def test_amendment_keyword_does_not_authorize_an_unstated_amount(self):
+        # "corrected to" only proves an amendment happened, not that the
+        # model's proposed number is the one the sentence actually states.
+        mutate = fixtures.edit(
+            "messages.csv", 0,
+            message_text="The payment amount has been corrected to ZAR 900.",
+        )
+        dataset_dir = fixtures.build_dataset(Path(tempfile.mkdtemp()), mutate=mutate)
+        data = load_dataset(dataset_dir)
+        context = data.context_for("request_01")
+        events_by_id = data.events_by_id
+        candidates = available_candidates(retrieve_candidates(context, events_by_id))
+        proposed = ProposedFact(
+            field="amended_amount", target_event_id="event_04", target_scope="event",
+            value="1", currency="ZAR", source_ids=("message_01",),
+            source_span="The payment amount has been corrected to ZAR 900.",
+        )
+        result = resolve_fact(proposed, candidates=candidates, context=context,
+                              events_by_id=events_by_id)
+        self.assertEqual(result.status, "rejected")
+        self.assertIn("do not state the proposed amended amount", result.reason)
+
+    def test_cancellation_question_or_instruction_is_not_a_completed_effect(self):
+        # A question ("Has this been cancelled?") or an instruction to act
+        # ("Please cancel this payment.") is not a statement that the
+        # cancellation already happened; absence of a negation marker does
+        # not make either one affirmative.
+        for text in ("Has this payment been cancelled?", "Please cancel this payment."):
+            with self.subTest(text=text):
+                mutate = fixtures.edit("messages.csv", 0, message_text=text)
+                dataset_dir = fixtures.build_dataset(Path(tempfile.mkdtemp()), mutate=mutate)
+                data = load_dataset(dataset_dir)
+                context = data.context_for("request_01")
+                events_by_id = data.events_by_id
+                candidates = available_candidates(retrieve_candidates(context, events_by_id))
+                proposed = ProposedFact(
+                    field="cancelled", target_event_id="event_04", target_scope="event",
+                    value="true", source_ids=("message_01",), source_span=text,
+                )
+                result = resolve_fact(proposed, candidates=candidates, context=context,
+                                      events_by_id=events_by_id)
+                self.assertEqual(result.status, "rejected")
+
+    def test_topic_mentions_and_failed_cancellation_do_not_establish_effect(self):
+        # Keyword mention that merely survives the negation/conditional/
+        # uncertainty denylist is not proof: neither sentence states the
+        # payment was actually cancelled, so neither may authorize
+        # cancelled=true just because no known-bad phrase was found.
+        for text in ("The cancellation policy is attached.", "Cancellation failed."):
+            with self.subTest(text=text):
+                mutate = fixtures.edit("messages.csv", 0, message_text=text)
+                dataset_dir = fixtures.build_dataset(Path(tempfile.mkdtemp()), mutate=mutate)
+                data = load_dataset(dataset_dir)
+                context = data.context_for("request_01")
+                events_by_id = data.events_by_id
+                candidates = available_candidates(retrieve_candidates(context, events_by_id))
+                proposed = ProposedFact(
+                    field="cancelled", target_event_id="event_04", target_scope="event",
+                    value="true", source_ids=("message_01",), source_span=text,
+                )
+                result = resolve_fact(proposed, candidates=candidates, context=context,
+                                      events_by_id=events_by_id)
+                self.assertEqual(result.status, "rejected")
+
+    def test_cancellation_statement_with_question_mark_elsewhere_clears_grammar_check(self):
+        # The question-mark check targets interrogative sentences, not any
+        # message that happens to contain a "?" elsewhere in its text -- it
+        # still clears the sentence-grammar check, but the field-level
+        # policy gate blocks acceptance by default.
+        mutate = fixtures.edit(
+            "messages.csv", 0,
+            message_text="Did you see my last message? Your payment has been cancelled.",
+        )
+        dataset_dir = fixtures.build_dataset(Path(tempfile.mkdtemp()), mutate=mutate)
+        data = load_dataset(dataset_dir)
+        context = data.context_for("request_01")
+        events_by_id = data.events_by_id
+        candidates = available_candidates(retrieve_candidates(context, events_by_id))
+        proposed = ProposedFact(
+            field="cancelled", target_event_id="event_04", target_scope="event",
+            value="true", source_ids=("message_01",),
+        )
+        result = resolve_fact(proposed, candidates=candidates, context=context,
+                              events_by_id=events_by_id)
+        self.assertEqual(result.status, "rejected")
+        self.assertIn("mutations are disabled", result.reason)
+
+    def test_decimal_amendment_is_not_truncated_at_sentence_boundary(self):
+        # The sentence splitter must not treat a decimal point as sentence
+        # punctuation: truncating "900.50" to "900" would bind the wrong
+        # amount, under-reserving the real debit. The correctly-bound
+        # amount still clears every evidence check (unlike the truncated
+        # one); the field-level policy gate blocks acceptance by default.
+        mutate = fixtures.edit(
+            "messages.csv", 0,
+            message_text="The payment amount has been corrected to ZAR 900.50.",
+        )
+        dataset_dir = fixtures.build_dataset(Path(tempfile.mkdtemp()), mutate=mutate)
+        data = load_dataset(dataset_dir)
+        context = data.context_for("request_01")
+        events_by_id = data.events_by_id
+        candidates = available_candidates(retrieve_candidates(context, events_by_id))
+        wrong = ProposedFact(
+            field="amended_amount", target_event_id="event_04", target_scope="event",
+            value="900", currency="ZAR", source_ids=("message_01",),
+        )
+        result = resolve_fact(wrong, candidates=candidates, context=context,
+                              events_by_id=events_by_id)
+        self.assertEqual(result.status, "rejected")
+        self.assertIn("do not state the proposed amended amount", result.reason)
+
+        correct = ProposedFact(
+            field="amended_amount", target_event_id="event_04", target_scope="event",
+            value="900.50", currency="ZAR", source_ids=("message_01",),
+        )
+        result = resolve_fact(correct, candidates=candidates, context=context,
+                              events_by_id=events_by_id)
+        self.assertEqual(result.status, "rejected")
+        self.assertIn("mutations are disabled", result.reason)
+
+    def test_wrong_currency_amount_is_rejected_without_a_usable_rate(self):
+        context, _, candidates = self.candidates("request_01")
+        proposed = ProposedFact(
+            field="amount", target_event_id="event_04", target_scope="event",
+            value="100", currency="USD", source_ids=("message_01",),
+        )
+        result = resolve_fact(proposed, candidates=candidates, context=context,
+                              events_by_id=self.events_by_id)
+        self.assertEqual(result.status, "rejected")
+        self.assertIn("does not match event currency", result.reason)
+
+    def test_matching_currency_amount_is_unaffected(self):
+        context, _, candidates = self.candidates("request_01")
+        proposed = ProposedFact(
+            field="amount", target_event_id="event_04", target_scope="event",
+            value="4365000", currency="ZAR", source_ids=("message_01",),
+        )
+        result = resolve_fact(proposed, candidates=candidates, context=context,
+                              events_by_id=self.events_by_id)
+        self.assertEqual(result.status, "accepted")
+        self.assertEqual(result.value, Decimal("4365000"))
+
+    def test_wrong_currency_amount_converts_with_an_exact_dated_rate(self):
+        # The fixture supplies an exact EUR->ZAR rate for 2024-02-15, so a
+        # EUR-denominated fact about the ZAR event settled that day must
+        # convert using it rather than being blanket-rejected.
+        context, _, candidates = self.candidates("request_01")
+        target = self.events_by_id["event_04"]  # ZAR, settled 2024-02-15
+        proposed = ProposedFact(
+            field="amount", target_event_id=target.event_id, target_scope="event",
+            value="100", currency="EUR", source_ids=("message_01",),
+        )
+        result = resolve_fact(proposed, candidates=candidates, context=context,
+                              events_by_id=self.events_by_id,
+                              rates_by_key=self.data.rates_by_key)
+        self.assertEqual(result.status, "accepted")
+        self.assertEqual(result.value, Decimal("2000.00"))  # 100 EUR @ 20 -> ZAR
+        # The stored value is now denominated in ZAR, not the EUR the model
+        # proposed -- the fact's own `currency` field must say so, and the
+        # conversion itself must be traceable rather than silently applied.
+        self.assertEqual(result.currency, "ZAR")
+        self.assertIsNotNone(result.conversion_note)
+        self.assertIn("EUR", result.conversion_note)
+        self.assertIn("ZAR", result.conversion_note)
+
+    def test_user_level_scope_cannot_smuggle_an_event_target(self):
+        context, _, candidates = self.candidates("request_01")
+        proposed = ProposedFact(
+            field="amended_amount", target_event_id="event_01", target_scope="user_level",
+            value="0", source_ids=("message_01",),
+        )
+        result = resolve_fact(proposed, candidates=candidates, context=context,
+                              events_by_id=self.events_by_id)
+        self.assertEqual(result.status, "rejected")
+        self.assertIn("user_level", result.reason)
+
+    def test_genuine_user_level_fact_with_no_event_target_is_unaffected(self):
+        context, _, candidates = self.candidates("request_01")
+        proposed = ProposedFact(
+            field="category", target_event_id=None, target_scope="user_level",
+            value="dining", source_ids=("message_01",),
+        )
+        result = resolve_fact(proposed, candidates=candidates, context=context,
+                              events_by_id=self.events_by_id)
+        self.assertEqual(result.status, "accepted")
+
+    def test_multiple_numbers_are_not_concatenated_into_money(self):
+        self.assertIsNone(parse_fact_amount("2 invoices of INR 500"))
+
+    def test_repeated_equal_numbers_are_not_concatenated_into_money(self):
+        # "500 plus 500" must not become 500500: counting DISTINCT numeric
+        # strings (both "500") let equal repeats slip through concatenation.
+        self.assertIsNone(parse_fact_amount("500 plus 500"))
+
+    def test_rejected_authorization_facts_never_reach_state_repair(self):
+        # An end-to-end guard: a rejected self-authorized cancellation must
+        # never patch the event it targeted.
+        context, _, candidates = self.candidates("request_01")
+        proposed = ProposedFact(
+            field="cancelled", target_event_id="event_01", target_scope="event",
+            value="true", source_ids=("event_01",),
+        )
+        fact = resolve_fact(proposed, candidates=candidates, context=context,
+                            events_by_id=self.events_by_id)
+        self.assertEqual(fact.status, "rejected")
+        patched = apply_facts_to_events(context.events, [fact])
+        patched_event = next(e for e in patched if e.event_id == "event_01")
+        self.assertEqual(patched_event.status, "settled")
+
+
 class CategoryAlignmentTests(EvidenceTestCase):
     def test_exact_category_is_accepted(self):
         value, reason = align_category("dining")
@@ -221,17 +547,32 @@ class NumericParsingTests(unittest.TestCase):
 
 
 class ConflictResolutionTests(EvidenceTestCase):
+    def _dataset_with_message_text(self, text: str):
+        mutate = fixtures.edit("messages.csv", 0, message_text=text)
+        dataset_dir = fixtures.build_dataset(Path(tempfile.mkdtemp()), mutate=mutate)
+        data = load_dataset(dataset_dir)
+        context = data.context_for("request_01")
+        events_by_id = data.events_by_id
+        candidates = available_candidates(retrieve_candidates(context, events_by_id))
+        return context, events_by_id, candidates
+
     def test_amendment_beats_plain_amount(self):
-        context, _, candidates = self.candidates("request_01")
+        # `resolve_fact` disables `amended_amount` acceptance by default
+        # (Phase A fourth-pass review), so this exercises `resolve_conflicts`
+        # precedence directly against already-accepted facts -- the ranking
+        # a future, stricter amendment validator would still rely on.
+        context, events_by_id, candidates = self._dataset_with_message_text(
+            "Correction: your February salary was actually paid as ZAR 4365000."
+        )
         plain = resolve_fact(
             ProposedFact(field="amount", target_event_id="event_04", target_scope="event",
                         value="4000000", source_ids=("message_01",)),
-            candidates=candidates, context=context, events_by_id=self.events_by_id,
+            candidates=candidates, context=context, events_by_id=events_by_id,
         )
-        amendment = resolve_fact(
-            ProposedFact(field="amended_amount", target_event_id="event_04", target_scope="event",
-                        value="4365000", source_ids=("message_01",)),
-            candidates=candidates, context=context, events_by_id=self.events_by_id,
+        amendment = ExtractedFact(
+            field="amended_amount", target_event_id="event_04", target_scope="event",
+            value=Decimal("4365000"), currency=None, value_date=None,
+            source_ids=("message_01",), status="accepted",
         )
         resolved = resolve_conflicts([plain, amendment], context)
         winners = [f for f in resolved if f.status == "accepted"]
@@ -243,16 +584,21 @@ class ConflictResolutionTests(EvidenceTestCase):
         self.assertIn("superseded", losers[0].reason)
 
     def test_cancellation_beats_plain_amount(self):
-        context, _, candidates = self.candidates("request_01")
+        # Same rationale as above: `cancelled` acceptance is disabled by
+        # default in `resolve_fact`, so `resolve_conflicts` precedence is
+        # exercised against an already-accepted fact directly.
+        context, events_by_id, candidates = self._dataset_with_message_text(
+            "Your February salary payment has been cancelled."
+        )
         plain = resolve_fact(
             ProposedFact(field="amount", target_event_id="event_04", target_scope="event",
                         value="4000000", source_ids=("message_01",)),
-            candidates=candidates, context=context, events_by_id=self.events_by_id,
+            candidates=candidates, context=context, events_by_id=events_by_id,
         )
-        cancelled = resolve_fact(
-            ProposedFact(field="cancelled", target_event_id="event_04", target_scope="event",
-                        value="true", source_ids=("message_01",)),
-            candidates=candidates, context=context, events_by_id=self.events_by_id,
+        cancelled = ExtractedFact(
+            field="cancelled", target_event_id="event_04", target_scope="event",
+            value=True, currency=None, value_date=None,
+            source_ids=("message_01",), status="accepted",
         )
         resolved = resolve_conflicts([plain, cancelled], context)
         winner_fields = {f.field for f in resolved if f.status == "accepted"}

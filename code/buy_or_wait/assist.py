@@ -144,7 +144,8 @@ def extract_facts(
                                  model_id=config.provider.model_id)
 
         resolved = tuple(
-            resolve_fact(p, candidates=candidates, context=context, events_by_id=events_by_id)
+            resolve_fact(p, candidates=candidates, context=context, events_by_id=events_by_id,
+                        rates_by_key=dataset.rates_by_key)
             for p in proposed
         )
         final_facts = resolve_conflicts(resolved, context)

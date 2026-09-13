@@ -1,8 +1,9 @@
 {
-  "version": 1,
+  "version": 2,
   "salt": "buy-or-wait-2026-09",
   "algorithm": "sha256(salt:request_id) ascending",
-  "sample_requests_sha256": "117bf2ab9e5f0054bae48afe8506f5daa35929559cb771f2c27dd4fe18da62f6",
+  "sample_requests_sha256": "1195bbe962e62a3eafa1118efc5fdef3f5fac0bf70009e6e59dab75b9228c5dc",
+  "sample_requests_sha256_raw": "117bf2ab9e5f0054bae48afe8506f5daa35929559cb771f2c27dd4fe18da62f6",
   "dev": [
     "request_01",
     "request_02",

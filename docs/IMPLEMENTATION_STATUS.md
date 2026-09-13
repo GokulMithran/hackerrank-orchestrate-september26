@@ -1121,3 +1121,626 @@ explicit authorization for the specific run (smoke batch or full dataset).
 **Review requested from Codex:** yes, on the `>=` boundary fix and the
 corrected regression tests; the test-isolation and `.env`/output.csv items
 are disclosed for awareness rather than requested as a formal review target.
+
+## Accuracy Phase A — evidence authorization holes (`docs/reviews/ACCURACY_IMPROVEMENT_PLAN.md`)
+
+A real, authorized 250-row assisted run completed earlier
+(`code/evaluation/usage_report.md`, 11 calls, ~40K tokens, ~$0.09). Codex's
+follow-up investigation (`docs/reviews/ACCURACY_IMPROVEMENT_PLAN.md`)
+reproduced eight offline regression probes
+(`docs/reviews/accuracy_regression_probes.py`) exposing evidence-authorization
+and recurrence gaps, and proposed a phased fix order: A (evidence safety) →
+B (broaden evidence investigation) → C (recurrence correctness). This entry
+covers Phase A only, per the plan's explicit sequencing
+("Implement Phase A first and hand back the focused diff and tests for Codex
+review; then proceed with authorized B/C work"). No paid calls were made.
+No frozen submission artifact (root `output.csv`, `evaluation/usage_report.md`,
+`evaluation/final/`) was touched.
+
+**Scope:** `code/buy_or_wait/evidence.py` only (plus threading a new optional
+parameter through its one caller in `assist.py`). Probes 1 (Phase B) and 6-8
+(Phase C) are out of scope and still fail, as expected.
+
+**Fixes, each mapped to its probe:**
+
+1. **Probe 2 — an event can no longer cite itself as proof of its own
+   cancellation/amendment.** `resolve_fact()`'s event-relevance check
+   previously accepted `source_id == event.event_id` as sufficient support
+   for *any* field, including `cancelled`/`amended_amount`. It now requires
+   at least one cited source *other than* the event's own id for those two
+   fields specifically -- a message or image that actually documents the
+   change. Plain `amount` (filling a currently-unknown value) is unaffected,
+   since existing tests (`StateRepairTests.test_plain_amount_never_overwrites_a_known_amount`)
+   rely on citing the event itself for that case, and the plan's concern is
+   specifically about a structured row "proving" its own cancellation, not
+   about repairing a blank field.
+2. **Probe 3 — a wrong-currency amount is rejected unless an exact, dated
+   rate authorizes a real conversion.** `resolve_fact()` now compares
+   `proposed.currency` against the target event's currency when both a
+   currency and a target event are present. On a mismatch it calls the
+   existing `fx.convert()` (never a new conversion path) using the event's
+   `settlement_date` and a `rates_by_key` table now threaded in as an
+   optional keyword argument (default `{}`, so every existing caller/test
+   that doesn't pass it keeps its prior all-reject behavior). `assist.py`'s
+   one call site now passes `dataset.rates_by_key`, the same table
+   `fx.py`/`forecast.py` already use, so a genuinely supplied directed rate
+   is honoured instead of the fact being dropped outright, while an
+   unavailable rate (`fx.RateUnavailable`) still rejects the fact rather
+   than guessing. Decision: chose the full FX-aware repair over an
+   always-reject shortcut because the plan explicitly asked for "an
+   explicit, valid conversion ... using the contract's exact directed
+   settlement-date rate," and the machinery to do this correctly already
+   existed and needed no new logic duplicated in `evidence.py`.
+3. **Probe 4 — a `user_level` fact can no longer carry an event target.**
+   `resolve_fact()` previously validated `target_scope` values but never
+   checked that a `user_level` fact's `target_event_id` was `None`, so
+   `apply_facts_to_events()` (keyed only on `target_event_id`, regardless of
+   scope) could still patch an event from a fact nominally scoped
+   `user_level`. Now rejected explicitly at the scope-check site.
+4. **Probe 5 — ambiguous multi-number text is rejected, not concatenated.**
+   `parse_fact_amount()` now scans the raw text for distinct contiguous
+   numeric runs (`\d[\d.,]*`) before its existing comma/dot-convention
+   normalization; more than one distinct run (e.g. `"2 invoices of INR
+   500"` -> `"2"` and `"500"`) rejects the value instead of silently
+   stripping the separating text and concatenating digits into `2500`. A
+   single grouped/decimalled number (`"1,234.56"`, `"1.234,56"`) is still one
+   run and parses exactly as before; all four existing `NumericParsingTests`
+   pass unchanged.
+5. **Trace completeness (plan: "Preserve source spans in traces"):**
+   `RowTrace.to_json()`'s `fact_json()` helper now serializes `source_span`
+   for both accepted and rejected facts; it was already stored on
+   `ExtractedFact` but silently dropped at serialization.
+
+**Tests:** added `EvidenceAuthorizationTests` (10 cases) to
+`code/tests/test_evidence.py`, covering each fix's rejection path plus a
+matching "still works" case (message-backed cancellation is still accepted;
+matching-currency and rate-backed cross-currency amounts are still accepted;
+a genuine user-level fact with no event target is still accepted) and one
+end-to-end check that a rejected self-authorized cancellation never reaches
+`apply_facts_to_events()`. This migrates the intent of probes 2-5 into the
+production suite per the plan's instruction ("Move the behavioral
+regressions into production tests while fixing them"), rather than leaving
+`docs/reviews/accuracy_regression_probes.py` as the only coverage.
+
+**Verification:**
+
+```text
+$ py -3.12 -B docs/reviews/accuracy_regression_probes.py
+Ran 8 tests: probes 2-5 pass; probe 1 (Phase B) and 6-8 (Phase C) still fail as expected.
+
+$ py -3.12 -B -m unittest discover -s code/tests -t code -p "test_*.py"
+Ran 264 tests in ~20s
+OK
+
+$ py -3.10 -B -m unittest discover -s code/tests -t code -p "test_*.py"
+Ran 264 tests in ~15s
+OK
+```
+
+**Not done in this pass (explicitly deferred to Phase B/C per the plan):**
+the blank-amount-only extraction gate in `assist.py` (probe 1), independent
+salary-stream separation, calendar-monthly day-of-month drift, and
+one-off-arrears-vs-recurring-income handling (probes 6-8). No live/paid
+provider run was made or is needed for Phase A, since all four fixes are
+pure validation-logic changes exercised by fixtures and a fake provider.
+
+**Review requested from Codex:** yes -- this is the Phase A handback the
+plan calls for. Please review before Phase B (`assist.py` extraction-gate
+broadening) or Phase C (`recurrence.py`) work begins.
+
+## Phase A corrective pass -- three findings from `docs/reviews/ADE_REVIEW_DISPOSITION.md`
+
+Codex's independent review of the Phase A handback (above) confirmed the
+scope was right but found three defects the original pass missed. All three
+are fixed in `code/buy_or_wait/evidence.py`; no other module changed.
+
+1. **Unsupported cancellations still passed (linked evidence is not
+   proof).** The self-citation guard only checked that a cited source *other
+   than the event itself* existed and was related by `related_event_id`; it
+   never checked that source actually said anything about a cancellation or
+   amendment. A message merely linked to the target event (e.g. "Your
+   February payslip is attached") could authorize `cancelled=true` for that
+   event. Fixed by `_has_supporting_language()`: for `cancelled`/
+   `amended_amount`, at least one cited source must contain field-appropriate
+   language (`_CANCELLATION_KEYWORDS` / `_AMENDMENT_KEYWORDS`). Ground truth
+   wins over the model's own claim -- if any cited source is a message, its
+   real `message_text` on file (never the model-supplied `source_span`)
+   decides the outcome, closing the fabricated-quote variant of the same
+   hole in the same fix. `source_span` is only consulted when no cited
+   source has independently verifiable text (e.g. image-only citations).
+   The existing `test_message_backed_cancellation_is_still_authorized`
+   fixture was itself misleading (it asserted "accepted" using unrelated
+   payslip text merely because of `related_event_id` linkage); corrected to
+   use a mutated dataset whose message text actually states the
+   cancellation, and two new regression tests
+   (`test_linked_message_silent_on_cancellation_does_not_authorize_it`,
+   `test_linked_message_silent_on_amendment_does_not_authorize_it`) pin the
+   fixed behavior, plus `test_source_span_alone_cannot_forge_supporting_language`
+   for the fabrication variant. `ConflictResolutionTests` also relied on the
+   same unrelated payslip text to construct amendment/cancellation facts;
+   both now build a small mutated dataset with genuinely supporting text.
+2. **Ambiguous repeated amounts were concatenated into invented money.**
+   `parse_fact_amount("500 plus 500")` returned `Decimal("500500")` because
+   the ambiguity check only rejected *distinct* numeric runs
+   (`{"500"} `-> length 1 -> allowed), not repeated occurrences. Fixed by
+   rejecting whenever more than one numeric run is present at all,
+   regardless of whether the values are equal
+   (`if len(runs) > 1: return None`), which is what the original inline
+   comment already described but the `distinct_runs` set implementation
+   did not enforce. Added
+   `test_repeated_equal_numbers_are_not_concatenated_into_money`; the
+   existing distinct-number and single-number tests are unaffected since a
+   single grouped/decimalled number is still exactly one run.
+3. **Converted facts carried the wrong currency, with no conversion
+   provenance.** After converting a cross-currency amount (e.g. 100 EUR ->
+   2000 ZAR), `resolve_fact()` stored the converted (ZAR) value but still
+   returned `proposed.currency` ("EUR") on the `ExtractedFact`, so the trace
+   showed a ZAR-magnitude figure mislabeled as EUR with no record that a
+   conversion happened. Fixed by tracking the fact's actual currency
+   separately (`fact_currency`, defaulted to `proposed.currency` and
+   reassigned to `converted.to_currency` only when a conversion actually
+   ran) and adding a new `ExtractedFact.conversion_note` field (populated
+   from `fx.Converted.cite()`, e.g. `"100 EUR -> EUR->ZAR @ 20 on
+   2024-02-15"`), serialized in `RowTrace.to_json()`. Extended
+   `test_wrong_currency_amount_converts_with_an_exact_dated_rate` to assert
+   `result.currency == "ZAR"` and that `conversion_note` names both
+   currencies.
+
+**Tests:** `code/tests/test_evidence.py` grew from 45 to 49 cases (4 new:
+2 authorization-language regressions, 1 fabrication-resistance case, 1
+repeated-number regression); 2 existing `EvidenceAuthorizationTests` /
+`ConflictResolutionTests` cases were corrected rather than added to, since
+they encoded the misleading fixture Codex flagged.
+
+**Verification:**
+
+```text
+$ py -3.12 -B -m unittest discover -s code/tests -t code -p "test_evidence.py"
+Ran 49 tests
+OK
+
+$ py -3.12 -B -m unittest discover -s code/tests -t code -p "test_*.py"
+Ran 268 tests
+OK
+
+$ py -3.12 -B code/main.py --mode audit --quiet
+audit: 0 finding(s), 0 error(s)
+```
+
+**Not done in this pass (still Phase B/C or later per the review's
+sequencing):** conflict-resolution order-dependence, independent replay,
+spending-validation event-ownership gate, horizon gate, corrupt-cache
+handling, run-ID collisions, retry/usage accounting, rounding, and the
+broader material-evidence extraction gate. These are unchanged from the
+prior handback's "not done" list plus the review's newer findings; none of
+them are evidence-authorization defects the three items above needed to
+also touch.
+
+**Review requested from Codex:** yes -- this is the corrective handback for
+the three findings in `docs/reviews/ADE_REVIEW_DISPOSITION.md`. The
+remaining sequence (conflict resolution, independent replay, spending/
+horizon validation, then Phase B/C, then rounding/cache/retry/run-ID) is
+still open and not attempted here.
+
+## Phase A second corrective pass (R-A-04, R-A-05) -- 2026-09-13
+
+Codex's `docs/reviews/PHASE_A_CORRECTIVE_REVIEW.md` found the numeric and
+currency fixes above sound, but the cancellation/amendment authorization
+boundary itself was still a routing heuristic, not proof of an actual
+financial change:
+
+1. **R-A-04 -- negated, conditional, and pending language authorized
+   cancellation.** `_has_supporting_language()` matched a keyword (e.g.
+   "cancel", "refund") anywhere in the cited text with no check on
+   polarity, certainty, or timing, so "This payment has **not** been
+   cancelled", "**If** you cancel next month...", and "Your refund request
+   is **pending**..." all authorized removing a real debit. Fixed by
+   replacing the whole-text substring match with sentence-level
+   affirmative-effect checking: `code/buy_or_wait/evidence.py`'s
+   `_affirmative_sentence()` splits cited ground-truth text into sentences,
+   requires a keyword-bearing sentence, and rejects that sentence if it
+   also contains a negation marker (`not`, `n't`, `never`, `no longer`,
+   `without`), a conditional marker (`if`, `unless`, `should`, `would`,
+   `were to`, `provided that`), or an uncertainty/pending marker (`pending`,
+   `will be`, `may`, `might`, `requested`, `next month`/`next week`,
+   `upcoming`, `planned`, `expected to`, `about to`). `_find_supporting_sentence()`
+   preserves the existing ground-truth-wins rule (a real message's text
+   decides over the model's own `source_span`; `source_span` is only
+   consulted when no cited source has retrievable ground truth, e.g.
+   image-only evidence).
+2. **R-A-05 -- amendment keyword did not bind the proposed amount.**
+   `resolve_fact()` accepted any `amended_amount` value once an amendment
+   keyword existed anywhere in the supporting text, so "The payment amount
+   has been corrected to ZAR 900" authorized a proposed amendment to ZAR 1.
+   Fixed by adding `_sentence_states_amount()`: once a qualifying amendment
+   sentence is found, the proposed amount (parsed via the existing
+   `parse_fact_amount()`) must equal the amount stated in that same
+   sentence, and if the sentence names a currency code it must match the
+   proposed currency. A mismatch is rejected with a distinct reason
+   ("do not state the proposed amended amount ...") before any currency
+   conversion or state repair can run.
+
+**Tests:** migrated Codex's two reproduction probes
+(`docs/reviews/phase_a_review_probes.py::test_negated_or_conditional_cancellation_is_not_authorized`,
+`::test_amendment_keyword_does_not_authorize_wrong_amount`) into
+`code/tests/test_evidence.py` as
+`test_negated_or_conditional_cancellation_is_not_authorized` (3 subcases:
+negation, conditional, pending-refund) and
+`test_amendment_keyword_does_not_authorize_an_unstated_amount`. Two
+existing `EvidenceAuthorizationTests` assertions were updated for the new
+(more specific) rejection wording, not weakened. Test count: 268 -> 270.
+
+**Verification:**
+
+```text
+$ py -3.12 -B -m unittest discover -s code/tests -p "test_*.py"
+Ran 270 tests
+OK
+
+$ py -3.10 -B -m unittest discover -s code/tests -p "test_*.py"
+Ran 270 tests
+OK
+
+$ py -3.12 -B docs/reviews/phase_a_review_probes.py
+Ran 5 tests
+OK
+```
+All five probes in `phase_a_review_probes.py` pass, including the two
+R-A-04/R-A-05 reproductions and the three previously-fixed R-A-02/R-A-03
+cases.
+
+**Not done in this pass:** the image-fallback limitation Codex noted
+(`evidence.py`'s `source_span` fallback for image-only evidence remains
+model-derived, uncertain evidence; this pass did not add independent
+OCR/pixel verification, nor was that requested) and the full remaining
+Phase A/B/C sequence (conflict-resolution order-dependence, independent
+replay, spending/horizon validation, rounding/cache/retry/run-ID) --
+unchanged from the prior handback's open list.
+
+**Review requested from Codex:** yes -- corrective handback for R-A-04 and
+R-A-05 from `docs/reviews/PHASE_A_CORRECTIVE_REVIEW.md`. No paid calls or
+frozen-artifact changes were made.
+
+## Phase A -- third corrective pass (R-A-06, R-A-07)
+
+Codex's `docs/reviews/PHASE_A_SENTENCE_REVIEW.md` found two more defects
+in the same narrow authorization boundary, both in `code/buy_or_wait/evidence.py`:
+
+- **R-A-06** (`evidence.py:269`): the sentence splitter treated a decimal
+  point as sentence punctuation, so "corrected to ZAR 900.50." was
+  truncated to "...900" before amount binding, silently accepting a
+  proposed 900 instead of the stated 900.50.
+- **R-A-07** (`evidence.py:284`): the affirmative-effect checker was still
+  keyword-plus-blacklist matching -- it accepted a question ("Has this
+  payment been cancelled?") and a bare instruction ("Please cancel this
+  payment.") as proof the cancellation had occurred, because neither
+  contains a negation/conditional/uncertainty marker.
+
+**Fix (both are structural, not additional blacklist phrases):**
+
+- `_SENTENCE_SPLIT` now only splits on `.`/`;`/`!`/`\n` when the character
+  is not both preceded and followed by a digit, so a decimal point inside
+  a number is never a sentence boundary. `_sentences()` was rewritten to
+  slice on match spans (instead of `re.split`, which discards the
+  delimiter) so a sentence keeps its own trailing `?` -- needed for
+  question detection -- while trailing `.`/`;`/`!` terminators are
+  stripped so they can never be mistaken for part of a preceding number.
+- `_is_affirmative_effect_sentence` now rejects any sentence containing
+  `?` (interrogative) and any sentence that is a subjectless directive:
+  `_is_imperative_instruction` matches only an exact bare verb
+  ("cancel", "refund", "correct", ...) as the sentence's very first word
+  (after an optional "please"/"kindly"), using a dedicated
+  `_IMPERATIVE_VERBS_BY_KEYWORDS` exact-word list kept separate from the
+  existing topic stems, so a noun like "Correction:" is never
+  misclassified as the command "correct".
+
+**Tests:** migrated Codex's two new probes into
+`code/tests/test_evidence.py` as
+`test_cancellation_question_or_instruction_is_not_a_completed_effect` and
+`test_decimal_amendment_is_not_truncated_at_sentence_boundary` (the latter
+also asserts the correctly-supported 900.50 amendment *is* accepted, not
+just that the wrong 900 is rejected). Added one further test,
+`test_cancellation_statement_with_question_mark_elsewhere_still_authorized`,
+so the new `?` check is confirmed to key off the sentence actually being a
+question, not merely off `?` appearing anywhere in the source message.
+Test count: 270 -> 273.
+
+**Verification:**
+
+```text
+$ py -3.12 -B -m unittest discover -s code/tests -p "test_*.py"
+Ran 273 tests
+OK
+
+$ py -3.10 -B -m unittest discover -s code/tests -p "test_*.py"
+Ran 273 tests
+OK
+
+$ py -3.12 -B docs/reviews/phase_a_review_probes.py
+Ran 7 tests
+OK
+
+$ py -3.10 -B docs/reviews/phase_a_review_probes.py
+Ran 7 tests
+OK
+```
+All seven probes pass on both interpreters, including the two new
+R-A-06/R-A-07 reproductions and the five previously-fixed cases.
+
+**Not done in this pass:** everything listed as open in the prior
+handback (image-fallback evidentiary strength, conflict-resolution
+order-dependence, independent replay, spending/horizon validation,
+rounding/cache/retry/run-ID, and the full Phase B/C sequence) is
+unchanged.
+
+**Review requested from Codex:** yes -- corrective handback for R-A-06 and
+R-A-07 from `docs/reviews/PHASE_A_SENTENCE_REVIEW.md`. No paid calls or
+frozen-artifact changes were made.
+
+## Phase A -- fourth corrective pass (default-accept authorization gap)
+
+Codex's `docs/reviews/PHASE_A_THIRD_PASS_REVIEW.md` confirmed R-A-06 and
+R-A-07 fixed, and identified one more hole in the same boundary
+(`evidence.py:342`, used by `evidence.py:357`): the cancellation checker
+rejected enumerated bad phrases and then *defaulted to acceptance* --
+it never required positive proof the effect had occurred. Two real
+messages still authorized `cancelled=true`:
+
+- "The cancellation policy is attached." (mentions the topic, states nothing)
+- "Cancellation failed." (explicitly reports the opposite of a completion)
+
+**Why cancellation only, not also amendment:** the reviewer's fallback
+recommendation was to disable cancellation *and* amendment mutations
+outright unless a real positive-effect validator exists. A validator was
+achievable for cancellation without regressing any passing case, so that
+path was taken instead of disabling a working, already-reviewed feature.
+Amendment was left as-is because it already carries a structurally
+different, stronger positive requirement that cancellation lacks: an
+amendment has no accepted effect unless the qualifying sentence also
+states the *exact* proposed amount (`_sentence_states_amount`), which is
+categorically not "keyword survived a denylist" -- it is deriving the
+claimed value from source text. No failure of that amount-binding check
+was demonstrated or is currently known.
+
+**Fix:** added `_CANCELLATION_COMPLETION_PATTERN`, a completed-effect
+grammar (auxiliary/copula -- `has been`/`have been`/`was`/`were`/`is`/`are`
+-- directly followed by an explicit past-participle: `cancelled`,
+`voided`, `reversed`, `refunded`, `terminated`, `stopped`, `withdrawn`)
+required, for the cancellation keyword set only, as a positive
+precondition inside `_is_affirmative_effect_sentence`. This is a grammar
+requirement, not another excluded phrase: "is attached" and "failed" do
+not match any participle in the pattern, so both new adversarial
+messages are now rejected without naming either one. All prior
+message-backed cancellation tests ("has been cancelled", "was
+cancelled") already use this exact grammar and continue to pass.
+
+**Disclosed residual limitation (not fixed in this pass):** the same
+class of default-accept risk is structurally possible for amendment if a
+policy sentence happens to state the exact number being proposed without
+asserting a correction (e.g. "Correction requests must be under $50."
+next to a proposed `amended_amount=50`). No such failure was demonstrated
+by Codex and none was found in the fixture/test corpus, but it has not
+been proven absent either. Tracked as open for Phase B; amendment
+mutations remain enabled based on the existing amount-binding safeguard
+being the best available positive check today.
+
+**Tests:** migrated Codex's new probe
+(`phase_a_review_probes.py::test_topic_mentions_and_failed_cancellation_do_not_establish_effect`)
+into `code/tests/test_evidence.py` as
+`test_topic_mentions_and_failed_cancellation_do_not_establish_effect`.
+Test count: 273 -> 274.
+
+**Verification:**
+
+```text
+$ py -3.12 -B -m unittest discover -s code/tests -p "test_*.py"
+Ran 274 tests
+OK
+
+$ py -3.10 -B -m unittest discover -s code/tests -p "test_*.py"
+Ran 274 tests
+OK
+
+$ py -3.12 -B docs/reviews/phase_a_review_probes.py
+Ran 8 tests
+OK
+```
+All eight probes pass, including the new R-A-08-class reproduction and
+the seven previously-fixed cases.
+
+**Not done in this pass:** the disclosed amendment-side residual above;
+everything else listed as open in the prior handback (image-fallback
+evidentiary strength, conflict-resolution order-dependence, independent
+replay, spending/horizon validation, rounding/cache/retry/run-ID, and the
+full Phase B/C sequence) is unchanged.
+
+**Review requested from Codex:** yes -- corrective handback for the
+default-accept finding in `docs/reviews/PHASE_A_THIRD_PASS_REVIEW.md`. No
+paid calls or frozen-artifact changes were made.
+
+## Phase A -- fifth pass: disable `cancelled`/`amended_amount` mutations by default
+
+`docs/reviews/PHASE_A_FOURTH_PASS_REVIEW.md` reproduced two more concrete
+effect-to-target binding failures on top of the disclosed amendment-side
+residual above, both accepted despite passing every prior check:
+
+- "The amendment processing fee is ZAR 1." authorized `amended_amount=1
+  ZAR` -- the number matched, but named a fee, not the payment's
+  replacement amount.
+- "Your cancellation request has been cancelled. The payment remains
+  due." authorized `cancelled=true` -- the completion grammar correctly
+  fired, but on the *request*, not the payment; the very next sentence
+  states the opposite of what was being authorized.
+
+Codex's explicit recommendation, after four corrective passes closing
+individual adversarial phrasings one at a time: stop enumerating more
+example words and instead disable `cancelled`/`amended_amount`
+acceptance by default until a validator exists that binds the claimed
+effect (and, for amendment, the amount) to its correct referent -- not
+just detects that *some* qualifying effect occurred somewhere in the
+cited text.
+
+**Decision:** implemented exactly that. This is a disclosed capability
+restriction, not a claim of complete evidence support for these two
+fields.
+
+**Fix:** added `evidence.ALLOW_EVENT_MUTATIONS = False` and a final gate
+in `resolve_fact` -- after citation, scope, relevance, self-citation,
+negation/conditional/uncertainty, completed-effect grammar, and (for
+amendment) amount/currency binding all already passed -- that rejects
+any `cancelled`/`amended_amount` proposal with a reason naming the
+policy and this review. The rest of the validation pipeline was
+deliberately left in place rather than deleted: it is still exercised by
+tests, still the strongest available defense-in-depth if a future,
+stricter validator re-enables the flag, and its absence would make the
+two reproduced defects look like the *only* gaps rather than instances
+of a structural one (matching a value/keyword is not the same as
+establishing what it refers to).
+
+**Tests:** updated `code/tests/test_evidence.py` so the acceptance-path
+tests for these two fields now assert the new disabled-by-default
+rejection (the underlying evidence checks they exercised -- e.g. that a
+genuinely message-backed cancellation clears the completed-effect
+grammar, or that a decimal amendment binds the full, untruncated number
+-- are preserved as intermediate assertions/renamed test names, not
+deleted). The two conflict-resolution precedence tests
+(`test_amendment_beats_plain_amount`, `test_cancellation_beats_plain_amount`)
+now construct an already-`accepted` `ExtractedFact` directly for the
+mutation side, since `resolve_conflicts` precedence logic is independent
+of, and still meaningful without, `resolve_fact`'s new gate. Both of
+Codex's new fourth-pass probes were already written as
+`assertEqual(status, "rejected")` with no reason-string coupling, so they
+require no changes and pass as-is.
+
+Added an end-to-end, fake-provider integration test class,
+`tests.test_assist.MutationFieldsDisabledByDefaultTests`, per Codex's ask:
+a fully evidence-backed cancellation and a fully evidence-backed
+amendment (real message text that would clear every check if the field
+were enabled) are proposed through `assist.extract_facts`, and the test
+asserts `facts == ()`, that `apply_facts_to_events` leaves the target
+event's `status`/`amount` unchanged, that `main.decide_one`'s forecast
+output is identical patched vs. unpatched, and that `citation_note`
+(what `main.py` folds into `decision_explanation`) is `None` -- i.e. the
+disabled mutation cannot reach events, the forecast, or the rendered
+explanation through any of those three seams.
+
+Test count: 274 -> 276 (2 new fake-provider integration tests; no test
+was deleted).
+
+**Verification:**
+
+```text
+$ py -3.12 -B -m unittest discover -s code/tests -p "test_*.py"
+Ran 276 tests
+OK
+
+$ py -3.10 -B -m unittest discover -s code/tests -p "test_*.py"
+Ran 276 tests
+OK
+
+$ py -3.12 -B docs/reviews/phase_a_review_probes.py
+Ran 10 tests
+OK
+```
+All ten probes pass, including both of Codex's new fourth-pass
+reproductions.
+
+**Not done in this pass:** re-enabling these two fields with a stricter
+effect-to-target/amount-role validator is deferred, not attempted, per
+Codex's explicit deadline guidance -- doing so correctly is more than a
+patch and the remaining time is better spent on the still-open items
+below. Everything listed as open in the prior handback (image-fallback
+evidentiary strength, conflict-resolution order-dependence, independent
+replay, spending/horizon validation, rounding/cache/retry/run-ID, and
+the full Phase B/C sequence) is unchanged.
+
+**Review requested from Codex:** yes -- handback for
+`docs/reviews/PHASE_A_FOURTH_PASS_REVIEW.md`. No paid calls or
+frozen-artifact changes were made.
+
+---
+
+## Deadline-handoff Block 1 (2026-09-13) — independent replay, citation gate, publish safety, split portability
+
+**Status:** all four Block 1 items from `docs/DEADLINE_HANDOFF.md` complete
+and verified with actual test output on this machine (not inherited/historical
+numbers). Phase A language-rule work stopped, as instructed; event mutations
+remain disabled. Block 2 (monthly recurrence / income-stream separation) not
+yet attempted — time-boxed decision pending against the 16:00 IST freeze.
+
+**1. Independent production replay (`validation.py`).** Added
+`independent_replay(forecast, extra)`, which re-derives debit→credit→payment
+ordering directly from `forecast.movements` and checks certifiability,
+opening/minimum balance, and each payment's request-date/horizon bounds —
+without calling `Forecast.walk`/`Forecast.is_safe`/`Forecast.breach_date`.
+Rule P1 now fails on `independent_replay`'s own breach date. Regression test
+`test_p1_independent_replay_survives_a_faulty_planner_safety_method` monkeypatches
+`Forecast.is_safe`/`Forecast.walk` to always claim safety and confirms P1 still
+fires — proving the gate cannot be fooled by a bug shared with the planner.
+
+**2. Spending-action citation gate (`validation.py`, `spending.py`).** A
+`stop:<event_id>`/`reduce_to:<event_id>:<amount>` literal is only accepted when
+`event_id` equals the actual citation id (`series.event_ids[-1]`) of a
+detected, eligible, permitted recurring **debit** `FixedSeries` — never any
+event row that merely matches by category/description.
+`test_e5_same_description_unrelated_event_cannot_authorize_a_cut` proves an
+impostor event with the same category/description but a different id is
+rejected (`E5`). Non-finite/negative `reduce_to` amounts are rejected both by
+the gate (`E7`, `test_e7_reduce_amount_must_be_finite_and_non_negative`) and
+defensively in `spending.apply_literals`, which now skips any parsed action
+whose amount is non-finite or negative before it can reach the replay
+forecast.
+
+**3. Failed-output publication safety (`main.py`).** An unhandled per-row
+exception ("crashed", distinct from an expected degraded/fallback row) now
+blocks `publish()` entirely and returns exit code 1, leaving any prior
+`output.csv` byte-for-byte untouched. New file `code/tests/test_publish_safety.py`
+proves both directions: a simulated `RuntimeError` on one row preserves a
+sentinel prior file and returns 1; a clean run still publishes and returns 0.
+
+**4. Split portability (`data.py`, `evaluation/splits.py`, `evaluation/main.py`).**
+Added `canonical_content_sha256` (newline-normalized before hashing) as the
+gating identity for `sample_requests.csv` in the frozen split manifest;
+`file_sha256` (raw bytes) is retained separately, for provenance only, and is
+expected to differ across a CRLF/LF checkout. `SPLIT_VERSION` bumped 1 → 2;
+`load_manifest` raises a clear `SplitError` for a legacy version-1 manifest
+rather than silently auto-migrating. `split_manifest.json` was migrated with a
+verified before/after equality check on the `dev`/`report` id lists (both
+`True`) prior to writing. New tests in `test_splits.py`: LF/CRLF-checkout
+content equivalence (`canonical_content_sha256` equal, `file_sha256` differs,
+both verify against the same manifest), a real value change still rejected
+(`test_an_actual_content_change_is_still_rejected`), and legacy-manifest
+rejection (`test_version_1_manifest_is_rejected_with_a_migration_message`).
+
+**Verification (actual run, this session, this machine):**
+
+```text
+$ python -m unittest discover -s tests -t . -p "test_*.py"        # from code/
+Ran 290 tests in 16.1s
+OK
+```
+
+290 tests, up from 276 at the start of this pass (14 new: 5
+`IndependentReplayTests`, 1 faulty-planner P1 regression, 1 same-description-
+citation regression (E5), 1 finite/non-negative regression (E7), 2
+`test_publish_safety.py`, 1 frozen-manifest-verifies-on-this-machine test, 3
+`PortabilityTests`, plus test-file unpacking fixes for the new 6-tuple
+`_spending_setup()` return value). No test was deleted or weakened to make
+this pass; all 276 prior tests still pass unmodified in behavior.
+
+**Known limitation surfaced during this pass, not fixed speculatively:** the
+LF/CRLF test fixture initially wrote both encodings to the same filename,
+silently overwriting the LF file with the CRLF one and producing a false
+failure (`file_sha256` equal when it should differ). Fixed by giving the two
+fixture files distinct names — a bug in the new test, not in
+`canonical_content_sha256`/`file_sha256` themselves, which were correct
+throughout.
+
+**Review requested from Codex:** yes — handback per `docs/DEADLINE_HANDOFF.md`.
+Worth attacking specifically: whether `independent_replay`'s re-derivation
+still shares any code path with `Forecast` that could hide a common bug beyond
+what the faulty-planner test exercises; whether the citation-gate change
+(`series.event_ids[-1]` keying) has any gap for a series with zero or one
+recorded event; and whether canonical-hash newline normalization is the right
+boundary (vs. e.g. also trimming trailing whitespace) for cross-platform
+manifest portability.

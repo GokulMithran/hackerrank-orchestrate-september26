@@ -145,7 +145,7 @@ def decide_one(context: RequestContext, rates) -> tuple[planner.Decision, list[v
 
     decision = planner.choose(request, profile, forecast, series, context.payment_options)
     failures = validation.check(decision, request, profile, forecast,
-                                context.payment_options, context.events)
+                                context.payment_options, context.events, series)
     if failures:
         decision = validation.conservative_fallback(
             request, "failed quality gate: " + "; ".join(str(f) for f in failures)
@@ -263,6 +263,19 @@ def run_predictions(dataset_dir: Path, out_path: Path, *, mode: str,
             print(f"  {request.request_id:14} {decision.affordability_status:22} "
                   f"{decision.recommended_payment_method}")
 
+    if crashed:
+        # An unhandled programming error is not the same as expected-unavailable
+        # evidence (which `predict_one` already degrades to the conservative
+        # fallback without raising). Publishing over a good prior `output.csv`
+        # with a run that hit a real bug would silently discard a working
+        # submission artifact, so the previous file is left untouched and the
+        # run is reported as failed instead.
+        print(f"\nrefusing to publish: {len(crashed)} row(s) hit an unhandled error; "
+              f"{out_path} left unchanged", file=sys.stderr)
+        for item in crashed[:10]:
+            print(f"  UNHANDLED: {item}", file=sys.stderr)
+        return 1
+
     publish(rows, out_path, [r.request_id for r in requests], dataset_dir=dataset_dir)
 
     if mode == "assisted" and assist_config is not None:
@@ -287,13 +300,10 @@ def run_predictions(dataset_dir: Path, out_path: Path, *, mode: str,
     print("method distribution: " + ", ".join(f"{k}={v}" for k, v in sorted(methods.items())))
     print(f"degraded rows      : {len(degraded)}")
     print(f"gate failures      : {len(gate_failures)}")
-    print(f"unhandled errors   : {len(crashed)}")
-    for label, items in (("GATE FAILURE", gate_failures), ("UNHANDLED", crashed)):
-        for item in items[:10]:
-            print(f"  {label}: {item}", file=sys.stderr)
+    for item in gate_failures[:10]:
+        print(f"  GATE FAILURE: {item}", file=sys.stderr)
 
-    # A systematic programming error must not be presentable as a clean run.
-    return 1 if crashed else 0
+    return 0
 
 
 def main(argv: list[str] | None = None) -> int:

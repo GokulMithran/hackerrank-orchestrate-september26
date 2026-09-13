@@ -34,7 +34,7 @@ try:  # optional: load ANTHROPIC_API_KEY etc. from a repo-root .env if present
 except ImportError:
     pass
 
-from buy_or_wait.data import DataError, file_sha256, load_dataset  # noqa: E402
+from buy_or_wait.data import DataError, canonical_content_sha256, file_sha256, load_dataset  # noqa: E402
 from evaluation import metrics  # noqa: E402
 from evaluation.labels import load_labels, sample_exposure_note  # noqa: E402
 from main import _build_assist_config, predict_one  # noqa: E402
@@ -82,7 +82,8 @@ def main(argv: list[str] | None = None) -> int:
     try:
         split = ensure_split(
             [r.request_id for r in data.sample_requests],
-            file_sha256(sample_path),
+            canonical_content_sha256(sample_path),
+            sample_sha256_raw=file_sha256(sample_path),
         )
         split.assert_disjoint()
     except SplitError as exc:

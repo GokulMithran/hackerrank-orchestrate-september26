@@ -304,10 +304,28 @@ def read_rows(path: Path, expected_header: Sequence[str]) -> Iterator[tuple[int,
 
 
 def file_sha256(path: Path) -> str:
+    """Raw-byte identity: changes with line-ending style, not just content."""
     digest = hashlib.sha256()
     with path.open("rb") as handle:
         for chunk in iter(lambda: handle.read(1 << 20), b""):
             digest.update(chunk)
+    return digest.hexdigest()
+
+
+def canonical_content_sha256(path: Path) -> str:
+    """Content identity that survives a CRLF/LF checkout difference.
+
+    Used to gate the frozen split manifest (`evaluation/splits.py`): a clone
+    on Linux/browser CI must not fail because `sample_requests.csv` was
+    checked out with different line endings than the machine that froze the
+    manifest. Normalizes `\\r\\n` and a bare `\\r` to `\\n` before hashing;
+    an actual value change (a differing byte once newlines are normalized)
+    still changes this hash.
+    """
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        data = handle.read()
+    digest.update(data.replace(b"\r\n", b"\n").replace(b"\r", b"\n"))
     return digest.hexdigest()
 
 
